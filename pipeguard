@@ -14,18 +14,22 @@ import argparse
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 MAX_SIZE_DEFAULT = 5 * 1024 * 1024  # 5 MB is far bigger than any sane installer
 TIMEOUT_DEFAULT = 20
@@ -124,6 +128,8 @@ RULES = [
          r"\bchmod\s+(?:-\w+\s+)*(?:\+x|[ugoa]*\+\w*x\w*|[0-7]{3,4})\s+[\"']?(?:/tmp|/var/tmp|/dev/shm)/"),
     Rule("NET003", "high", "second-stage", "Uses /dev/shm (a common malware hiding spot)",
          r"/dev/shm/"),
+    Rule("NET005", "medium", "second-stage", "Downloads from a raw IP address instead of a domain",
+         r"\b(?:curl|wget)\b[^;&|\n]*\bhttps?://\d{1,3}(?:\.\d{1,3}){3}\b"),
     Rule("NET004", "high", "second-stage", "Downloads to a hidden file",
          r"\b(?:curl|wget)\b[^;&|\n]*(?:-o|-O|--output)\s*[\"']?(?:\S*/)?\.[\w.-]+[\"']?(?:\s|$)"),
 
@@ -194,6 +200,15 @@ META_RULES = {r.id: r for r in [
     Rule("TRN010", "high", "transport", "Script was fetched over unencrypted HTTP", None),
     Rule("TRN011", "high", "transport", "HTTPS request was redirected to plain HTTP", None),
     Rule("TRN012", "low", "transport", "Request was redirected to a different host", None),
+    Rule("TLS001", "critical", "tls", "TLS certificate is invalid - download blocked", None),
+    Rule("TLS002", "high", "tls", "TLS handshake failed - download blocked", None),
+    Rule("TLS003", "low", "tls", "TLS certificate expires within 14 days", None),
+    Rule("TLS004", "high", "tls", "Server uses an outdated TLS version", None),
+    Rule("SRC001", "medium", "source", "Hosted on a raw IP address, not a domain", None),
+    Rule("SRC002", "medium", "source", "Uses a URL shortener that hides the real destination", None),
+    Rule("SRC003", "medium", "source", "Hosted on an anonymous paste/file-drop service", None),
+    Rule("SRC004", "medium", "source", "Internationalized domain (possible look-alike)", None),
+    Rule("SRC005", "low", "source", "Uses a non-standard port", None),
 ]}
 
 # Lines that only print a message. For these, low/medium rules ignore text
@@ -383,81 +398,287 @@ EXIT_FOR_VERDICT = {"clean": EXIT_OK, "low": EXIT_OK, "medium": EXIT_WARN,
 
 
 # --------------------------------------------------------------------------
-# Input
+# Input: fetch, sniff, and stop early on anything that isn't a script
 # --------------------------------------------------------------------------
 
 class PipeguardError(Exception):
     pass
 
 
-def fetch_url(url, max_size, timeout):
-    # Pretend to be curl: some servers send different content to browsers,
-    # and we want to see what `curl | bash` would have received.
-    request = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0", "Accept": "*/*"})
+SNIFF_BYTES = 4096   # we look at this much before deciding whether to read more
+
+# File "magic numbers": the first bytes identify the real file type,
+# no matter what the URL or the server claims.
+SIGNATURES = [
+    (b"PK\x03\x04", "ZIP archive"),
+    (b"\x1f\x8b", "gzip archive"),
+    (b"BZh", "bzip2 archive"),
+    (b"\xfd7zXZ\x00", "xz archive"),
+    (b"(\xb5/\xfd", "zstd archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"!<arch>", "ar archive / .deb package"),
+    (b"\xed\xab\xee\xdb", "RPM package"),
+    (b"\x7fELF", "Linux executable (ELF binary)"),
+    (b"MZ", "Windows executable"),
+    (b"\xca\xfe\xba\xbe", "Mach-O binary / Java class"),
+    (b"%PDF", "PDF document"),
+    (b"\x89PNG", "PNG image"),
+    (b"\xff\xd8\xff", "JPEG image"),
+    (b"GIF8", "GIF image"),
+    (b"\x1aE\xdf\xa3", "MKV/WebM video"),
+    (b"ID3", "MP3 audio"),
+    (b"OggS", "Ogg audio/video"),
+    (b"RIFF", "RIFF media (WAV/AVI/WebP)"),
+]
+
+
+def sniff(head, content_type=""):
+    """Return a description if `head` is clearly NOT a script, else None."""
+    for magic, name in SIGNATURES:
+        if head.startswith(magic):
+            return name
+    if head[4:8] == b"ftyp":
+        return "MP4/MOV video"
+    if head[257:262] == b"ustar":
+        return "tar archive"
+    start = head.lstrip()[:20].lower()
+    if start.startswith((b"<!doctype html", b"<html", b"<head")):
+        return "HTML web page"
+    if b"\x00" in head:
+        return "binary data"
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if ctype.startswith(("video/", "audio/", "image/", "font/")):
+        return "%s file" % ctype
+    return None
+
+
+class RedirectRecorder(urllib.request.HTTPRedirectHandler):
+    """Remembers every redirect hop so we can spot HTTPS -> HTTP downgrades."""
+
+    def __init__(self):
+        self.hops = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.hops.append({"status": code, "from": req.full_url, "to": newurl})
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def probe_tls(host, port, timeout):
+    """Open a TLS connection just to read the certificate details."""
+    info = {"host": host}
+    context = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = response.read(max_size + 1)
-            final_url = response.geturl()
-            content_type = response.headers.get("Content-Type", "")
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with context.wrap_socket(raw, server_hostname=host) as tls:
+                cert = tls.getpeercert() or {}
+                info["version"] = tls.version()
+                issuer = dict(item[0] for item in cert.get("issuer", ()))
+                info["issuer"] = issuer.get("organizationName") or issuer.get("commonName") or "unknown"
+                if cert.get("notAfter"):
+                    expires = ssl.cert_time_to_seconds(cert["notAfter"])
+                    info["days_left"] = int((expires - time.time()) // 86400)
+    except ssl.SSLCertVerificationError as exc:
+        info["error"] = exc.verify_message or str(exc)
+    except (ssl.SSLError, OSError) as exc:
+        info["unavailable"] = str(exc)
+    return info
+
+
+def content_length(headers):
+    try:
+        return int(headers.get("Content-Length", ""))
+    except ValueError:
+        return None
+
+
+def fetch_url(url, max_size, timeout, inspect_only):
+    meta = {"source": url, "final_url": url, "kind": None, "size": None,
+            "connection": {"hops": [], "status": None, "headers": {}, "tls": [], "tls_error": None}}
+    conn = meta["connection"]
+    recorder = RedirectRecorder()
+    conn["hops"] = recorder.hops
+    opener = urllib.request.build_opener(recorder)
+    # Pretend to be curl: some servers send different content to browsers,
+    # and we want to see exactly what `curl | bash` would have received.
+    request = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0", "Accept": "*/*"})
+    data = None
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            meta["final_url"] = response.geturl()
+            conn["status"] = getattr(response, "status", None)
+            wanted = ("Content-Type", "Content-Length", "Content-Disposition", "Server",
+                      "Strict-Transport-Security", "Last-Modified")
+            conn["headers"] = {k: response.headers.get(k) for k in wanted if response.headers.get(k)}
+            length = content_length(response.headers)
+            meta["size"] = length
+
+            head = response.read(SNIFF_BYTES)
+            kind = sniff(head, conn["headers"].get("Content-Type"))
+            if kind:
+                meta["kind"] = kind                      # stop: not a script
+            elif inspect_only:
+                meta["kind"] = "not scanned (--inspect)"
+            elif length is not None and length > max_size:
+                meta["kind"] = "file too large to be a script"
+            else:
+                data = head + response.read(max_size + 1 - len(head))
+                if len(data) > max_size:
+                    data, meta["kind"] = None, "file too large to be a script"
+                else:
+                    meta["size"] = len(data)
     except urllib.error.HTTPError as exc:
         raise PipeguardError("server returned HTTP %d for %s" % (exc.code, url))
     except urllib.error.URLError as exc:
-        raise PipeguardError("could not download %s: %s" % (url, exc.reason))
-    except (TimeoutError, OSError) as exc:
-        raise PipeguardError("could not download %s: %s" % (url, exc))
-    if len(data) > max_size:
-        raise PipeguardError("script is larger than %s; refusing (use --max-size)" % human_size(max_size))
-    return data, final_url, content_type
-
-
-def read_file(path, max_size):
-    try:
-        with open(path, "rb") as handle:
-            data = handle.read(max_size + 1)
+        reason = exc.reason
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            conn["tls_error"] = ("cert", reason.verify_message or str(reason))
+        elif isinstance(reason, ssl.SSLError):
+            conn["tls_error"] = ("handshake", getattr(reason, "reason", None) or str(reason))
+        else:
+            raise PipeguardError("could not download %s: %s" % (url, reason))
+        meta["kind"] = "blocked: TLS verification failed"
+    except ssl.SSLError as exc:
+        conn["tls_error"] = ("handshake", getattr(exc, "reason", None) or str(exc))
+        meta["kind"] = "blocked: TLS verification failed"
     except OSError as exc:
-        raise PipeguardError("cannot read %s: %s" % (path, exc.strerror or exc))
-    if len(data) > max_size:
-        raise PipeguardError("file is larger than %s; refusing (use --max-size)" % human_size(max_size))
-    return data
+        raise PipeguardError("could not download %s: %s" % (url, exc))
+
+    if not conn["tls_error"]:
+        probe_tls_hosts(meta, timeout)
+    return data, meta
 
 
-def load_input(target, max_size, timeout):
-    meta = {"source": target, "final_url": None, "content_type": None}
-    if target is None:
-        if sys.stdin.isatty():
-            raise PipeguardError("no script given. Try: pipeguard URL, pipeguard FILE, or curl URL | pipeguard")
-        meta["source"] = "<stdin>"
-        data = sys.stdin.buffer.read(max_size + 1)
-        if len(data) > max_size:
-            raise PipeguardError("input is larger than %s; refusing (use --max-size)" % human_size(max_size))
-    elif re.match(r"^https?://", target, re.IGNORECASE):
-        data, meta["final_url"], meta["content_type"] = fetch_url(target, max_size, timeout)
-    elif "://" in target:
+def probe_tls_hosts(meta, timeout):
+    urls = [meta["source"]] + [hop["to"] for hop in meta["connection"]["hops"]]
+    seen = set()
+    for url in urls:
+        parts = urllib.parse.urlparse(url)
+        if parts.scheme != "https" or not parts.hostname or parts.hostname in seen:
+            continue
+        seen.add(parts.hostname)
+        if len(seen) > 3:
+            break
+        meta["connection"]["tls"].append(probe_tls(parts.hostname, parts.port or 443, min(timeout, 5)))
+
+
+def load_input(target, max_size, timeout, inspect_only=False):
+    if target is not None and re.match(r"^https?://", target, re.IGNORECASE):
+        data, meta = fetch_url(target, max_size, timeout, inspect_only)
+    elif target is not None and "://" in target:
         raise PipeguardError("only http:// and https:// URLs are supported")
     else:
-        data = read_file(target, max_size)
-    if not data.strip():
+        meta = {"source": target, "final_url": None, "kind": None, "size": None, "connection": None}
+        if target is None:
+            if sys.stdin.isatty():
+                raise PipeguardError("no script given. Try: pipeguard URL, pipeguard FILE, or curl URL | pipeguard")
+            meta["source"] = "<stdin>"
+            stream = sys.stdin.buffer
+        else:
+            try:
+                stream = open(target, "rb")
+                meta["size"] = os.fstat(stream.fileno()).st_size
+            except OSError as exc:
+                raise PipeguardError("cannot read %s: %s" % (target, exc.strerror or exc))
+        try:
+            head = stream.read(SNIFF_BYTES)
+            kind = sniff(head)
+            if kind:
+                # Stop reading right away. If this came from `curl | pipeguard`,
+                # curl gets a broken pipe and stops downloading too.
+                meta["kind"] = kind
+                return None, meta
+            if meta["size"] is not None and meta["size"] > max_size:
+                raise PipeguardError("file is %s, too large to be a script (use --max-size)" % human_size(meta["size"]))
+            data = head + stream.read(max_size + 1 - len(head))
+        finally:
+            if stream is not sys.stdin.buffer:
+                stream.close()
+        if len(data) > max_size:
+            raise PipeguardError("input is larger than %s; refusing (use --max-size)" % human_size(max_size))
+        meta["size"] = len(data)
+
+    if data is not None and not data.strip():
         raise PipeguardError("the script is empty")
     return data, meta
 
 
-def transport_findings(scanner, meta):
-    source, final = meta["source"] or "", meta["final_url"]
-    if source.lower().startswith("http://"):
-        scanner.add(META_RULES["TRN010"], 0, source)
-    if final and final != source:
-        if source.lower().startswith("https://") and final.lower().startswith("http://"):
-            scanner.add(META_RULES["TRN011"], 0, "%s -> %s" % (source, final))
-        if urllib.parse.urlparse(source).hostname != urllib.parse.urlparse(final).hostname:
-            scanner.add(META_RULES["TRN012"], 0, "%s -> %s" % (source, final))
+# --------------------------------------------------------------------------
+# Connection & source checks
+# --------------------------------------------------------------------------
+
+SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "v.gd", "rb.gy", "cutt.ly",
+              "ow.ly", "buff.ly", "shorturl.at", "tiny.cc", "t.ly")
+ANON_HOSTS = ("pastebin.com", "paste.ee", "termbin.com", "0x0.st", "transfer.sh", "file.io",
+              "hastebin.com", "paste.rs", "dpaste.org", "controlc.com", "temp.sh", "ghostbin.co")
 
 
-def notices_for(data, text, meta):
+def host_in(host, domains):
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def connection_findings(scanner, meta):
+    conn = meta.get("connection")
+    if not conn:
+        return
+    chain = [meta["source"]] + [hop["to"] for hop in conn["hops"]]
+
+    if chain[0].lower().startswith("http://"):
+        scanner.add(META_RULES["TRN010"], 0, chain[0])
+    for hop in conn["hops"]:
+        if hop["from"].lower().startswith("https://") and hop["to"].lower().startswith("http://"):
+            scanner.add(META_RULES["TRN011"], 0, "%s -> %s" % (hop["from"], hop["to"]))
+    first_host = urllib.parse.urlparse(chain[0]).hostname
+    last_host = urllib.parse.urlparse(chain[-1]).hostname
+    if first_host != last_host:
+        scanner.add(META_RULES["TRN012"], 0, "%s -> %s" % (first_host, last_host))
+
+    seen = set()
+    for url in chain:
+        parts = urllib.parse.urlparse(url)
+        host = (parts.hostname or "").lower()
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        if is_ip(host):
+            scanner.add(META_RULES["SRC001"], 0, url)
+        if host_in(host, SHORTENERS):
+            scanner.add(META_RULES["SRC002"], 0, url)
+        if host_in(host, ANON_HOSTS):
+            scanner.add(META_RULES["SRC003"], 0, url)
+        if "xn--" in host:
+            scanner.add(META_RULES["SRC004"], 0, "%s (shown in browsers as unicode)" % host)
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if port not in (None, 80, 443):
+            scanner.add(META_RULES["SRC005"], 0, url)
+
+    if conn["tls_error"]:
+        kind, reason = conn["tls_error"]
+        rule = META_RULES["TLS001"] if kind == "cert" else META_RULES["TLS002"]
+        scanner.add(rule, 0, reason)
+    for info in conn["tls"]:
+        if info.get("error"):
+            scanner.add(META_RULES["TLS001"], 0, "%s: %s" % (info["host"], info["error"]))
+        if info.get("version") in ("SSLv3", "TLSv1", "TLSv1.1"):
+            scanner.add(META_RULES["TLS004"], 0, "%s uses %s" % (info["host"], info["version"]))
+        if info.get("days_left") is not None and info["days_left"] < 14:
+            scanner.add(META_RULES["TLS003"], 0, "%s: %d days left" % (info["host"], info["days_left"]))
+
+
+def notices_for(data, text):
     notes = []
     if b"\x00" in data:
         notes.append("Input contains NUL bytes - it looks binary, so this analysis is unreliable.")
-    if meta.get("content_type") and "html" in meta["content_type"].lower():
-        notes.append("Server returned HTML, not a script. Is the URL right? (GitHub 'blob' links need 'raw')")
     first = text.lstrip().splitlines()[0] if text.strip() else ""
     if first.startswith("#!") and not re.search(r"\b(?:ba|da|z|k)?sh\b", first):
         notes.append("Shebang is '%s' - rules are tuned for shell scripts." % first.strip())
@@ -483,49 +704,108 @@ class Color:
 SEVERITY_STYLE = {"low": ("blue",), "medium": ("yellow",), "high": ("red", "bold"),
                   "critical": ("bgred", "bold"), "clean": ("green", "bold")}
 
+CONNECTION_TEXT = {
+    "clean": "Connection checks passed. The file's contents were NOT analyzed.",
+    "low": "Minor connection notes. The file's contents were NOT analyzed.",
+    "medium": "Be careful with this source. The file's contents were NOT analyzed.",
+    "high": "Connection problems found. Don't trust this download.",
+    "critical": "Connection is not trustworthy. Don't use this download.",
+}
+
 
 def human_size(n):
-    for unit in ("B", "KB", "MB"):
-        if n < 1024 or unit == "MB":
+    if n is None:
+        return "unknown size"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
             return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
         n /= 1024.0
 
 
+def disposition_filename(value):
+    match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", value or "", re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def connection_lines(conn):
+    p = Color.paint
+    out = ["  " + p("Connection", "bold")]
+    for hop in conn["hops"]:
+        out.append("    %s %s  %s -> %s" % (p("Redirect ", "dim"), hop["status"], hop["from"], hop["to"]))
+    for info in conn["tls"]:
+        if info.get("version"):
+            days = info.get("days_left")
+            expiry = ("expires in %d days" % days) if days is not None else "expiry unknown"
+            out.append("    %s %s, cert by %s, %s  %s" % (
+                p("TLS      ", "dim"), info["version"], info["issuer"], expiry, p("(%s)" % info["host"], "dim")))
+        elif info.get("unavailable"):
+            out.append("    %s details unavailable (%s); certificate was still verified" % (
+                p("TLS      ", "dim"), info["host"]))
+    headers = conn["headers"]
+    if conn["status"] is not None:
+        hsts = headers.get("Strict-Transport-Security")
+        out.append("    %s %s" % (p("HSTS     ", "dim"), ("yes (%s)" % hsts) if hsts else "no"))
+        out.append("    %s %s" % (p("Type     ", "dim"), headers.get("Content-Type", "not given")))
+        if headers.get("Server"):
+            out.append("    %s %s" % (p("Server   ", "dim"), headers["Server"]))
+        name = disposition_filename(headers.get("Content-Disposition"))
+        if name:
+            out.append("    %s %s" % (p("Filename ", "dim"), name))
+    out.append("")
+    return out
+
+
 def print_report(result):
     p = Color.paint
-    out = []
-    out.append("")
-    out.append(p("pipeguard %s" % __version__, "bold") + p("  - look before you pipe", "dim"))
-    out.append("")
+    out = ["", p("pipeguard %s" % __version__, "bold") + p("  - look before you pipe", "dim"), ""]
     out.append("  %s  %s" % (p("Source ", "dim"), result["source"]))
     if result["final_url"] and result["final_url"] != result["source"]:
         out.append("  %s  %s" % (p("Final  ", "dim"), result["final_url"]))
-    out.append("  %s  %s, %d lines" % (p("Size   ", "dim"), human_size(result["size"]), result["lines"]))
-    out.append("  %s  %s" % (p("SHA-256", "dim"), result["sha256"]))
+    if result["kind"] is None:
+        out.append("  %s  %s, %d lines" % (p("Size   ", "dim"), human_size(result["size"]), result["lines"]))
+        out.append("  %s  %s" % (p("SHA-256", "dim"), result["sha256"]))
     if result.get("saved_to"):
         out.append("  %s  %s" % (p("Saved  ", "dim"), result["saved_to"]))
+    out.append("")
+
+    if result["connection"]:
+        out.extend(connection_lines(result["connection"]))
+
+    kind = result["kind"]
+    if kind:
+        out.append("  " + p("Not a script:", "yellow", "bold") + " %s (%s)" % (kind, human_size(result["size"])))
+        if kind.startswith("blocked"):
+            out.append("  Nothing was downloaded. curl would refuse this too, unless someone adds -k.")
+        elif kind.startswith("not scanned"):
+            out.append("  Only headers and the first 4 KB were read.")
+        else:
+            out.append("  Stopped after the first 4 KB, so the rest was never downloaded.")
+            if kind == "HTML web page":
+                out.append("  If this is a GitHub link, use the 'Raw' URL of the file instead.")
+            else:
+                out.append("  pipeguard analyzes scripts; it can't judge what's inside archives, media or binaries.")
+                out.append("  To verify a file like this, compare `sha256sum FILE` with the publisher's checksum.")
+        out.append("")
 
     for note in result["notices"]:
-        out.append("")
         out.append("  " + p("note:", "yellow", "bold") + " " + note)
+        out.append("")
 
-    # group findings by rule, most severe first
     groups = {}
     for f in result["findings"]:
         groups.setdefault(f["rule"], []).append(f)
     ordered = sorted(groups.values(),
                      key=lambda g: (-SEVERITIES.index(g[0]["severity"]), g[0]["line"]))
-
-    out.append("")
     if not ordered:
         out.append("  " + p("No findings.", "green"))
+        out.append("")
     for group in ordered:
         first = group[0]
         label = p(" %-8s " % first["severity"].upper(), *SEVERITY_STYLE[first["severity"]])
         out.append("  %s %s %s" % (label, p(first["title"], "bold"),
                                    p("[%s %s]" % (first["rule"], first["category"]), "dim")))
         for f in group[:MAX_SHOWN_PER_RULE]:
-            where = ("L%d" % f["line"]) if f["line"] else "   "
+            where = ("L%d" % f["line"]) if f["line"] else "-"
             out.append("      %s  %s" % (p("%-5s" % where, "cyan"), f["code"]))
             if f["context"]:
                 out.append("             %s" % p("^ " + f["context"], "magenta"))
@@ -543,10 +823,11 @@ def print_report(result):
         out.append("")
 
     verdict = result["verdict"]
+    label = "Verdict:" if kind is None else "Connection:"
     out.append("  %s %s/100   %s %s" % (
         p("Risk score:", "bold"), result["score"],
-        p("Verdict:", "bold"), p(" %s " % verdict.upper(), *SEVERITY_STYLE[verdict])))
-    out.append("  " + VERDICT_TEXT[verdict])
+        p(label, "bold"), p(" %s " % verdict.upper(), *SEVERITY_STYLE[verdict])))
+    out.append("  " + (VERDICT_TEXT if kind is None else CONNECTION_TEXT)[verdict])
     out.append("")
     print("\n".join(out))
 
@@ -575,8 +856,7 @@ def confirm_run(verdict, terminal):
         accepted = ("y", "yes")
     sys.stdout.write(question)
     sys.stdout.flush()
-    answer = terminal.readline().strip().lower()
-    return answer in accepted
+    return terminal.readline().strip().lower() in accepted
 
 
 def run_saved_script(path, shell, use_sudo, terminal):
@@ -607,23 +887,28 @@ def save_copy(data):
 # --------------------------------------------------------------------------
 
 def analyze(data, meta):
-    text = data.decode("utf-8", errors="replace")
-    scanner = Scanner().scan(text)
-    transport_findings(scanner, meta)
+    scanner = Scanner()
+    text = ""
+    if data is not None:
+        text = data.decode("utf-8", errors="replace")
+        scanner.scan(text)
+    connection_findings(scanner, meta)
     score = compute_score(scanner.findings)
     return {
         "tool": "pipeguard",
         "version": __version__,
         "source": meta["source"],
-        "final_url": meta["final_url"],
-        "size": len(data),
-        "lines": text.count("\n") + (0 if text.endswith("\n") else 1),
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "final_url": meta.get("final_url"),
+        "kind": meta.get("kind"),
+        "size": meta.get("size", len(data) if data is not None else None),
+        "lines": (text.count("\n") + (0 if text.endswith("\n") else 1)) if data is not None else None,
+        "sha256": hashlib.sha256(data).hexdigest() if data is not None else None,
         "score": score,
         "verdict": compute_verdict(scanner.findings, score),
         "findings": scanner.findings,
         "urls": scanner.urls,
-        "notices": notices_for(data, text, meta),
+        "connection": meta.get("connection"),
+        "notices": notices_for(data, text) if data is not None else [],
     }
 
 
@@ -633,6 +918,7 @@ def build_parser():
         description="Look before you pipe: analyze a shell script for risky behaviour before running it.",
         epilog="examples:\n"
                "  pipeguard https://example.com/install.sh\n"
+               "  pipeguard --inspect https://example.com/big-download.zip\n"
                "  pipeguard ./install.sh\n"
                "  curl -fsSL https://example.com/install.sh | pipeguard --run\n\n"
                "exit codes: 0 clean/low, 1 medium, 2 high/critical, 3 error\n"
@@ -641,6 +927,8 @@ def build_parser():
     parser.add_argument("target", nargs="?", help="URL or file path (omit to read from stdin)")
     parser.add_argument("--run", action="store_true",
                         help="after the report, ask to run the exact analyzed copy")
+    parser.add_argument("--inspect", action="store_true",
+                        help="URL only: check redirects, TLS and headers without downloading the body")
     parser.add_argument("--shell", default="bash", help="shell used by --run (default: bash)")
     parser.add_argument("--sudo", action="store_true", help="with --run, run it via sudo")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
@@ -649,7 +937,7 @@ def build_parser():
     parser.add_argument("--max-size", type=int, default=MAX_SIZE_DEFAULT, metavar="BYTES",
                         help="refuse scripts bigger than this (default: 5 MB)")
     parser.add_argument("--timeout", type=int, default=TIMEOUT_DEFAULT, metavar="SEC",
-                        help="download timeout in seconds (default: %d)" % TIMEOUT_DEFAULT)
+                        help="network timeout in seconds (default: %d)" % TIMEOUT_DEFAULT)
     parser.add_argument("-V", "--version", action="version", version="pipeguard " + __version__)
     return parser
 
@@ -658,19 +946,19 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     Color.enabled = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
 
-    if args.sudo and not args.run:
-        print("pipeguard: --sudo only makes sense with --run", file=sys.stderr)
-        return EXIT_ERROR
-    if args.run and args.json:
-        print("pipeguard: --run and --json can't be combined", file=sys.stderr)
-        return EXIT_ERROR
+    for bad, message in ((args.sudo and not args.run, "--sudo only makes sense with --run"),
+                         (args.run and args.json, "--run and --json can't be combined"),
+                         (args.run and args.inspect, "--run and --inspect can't be combined")):
+        if bad:
+            print("pipeguard: " + message, file=sys.stderr)
+            return EXIT_ERROR
 
     saved = None
     try:
-        data, meta = load_input(args.target, args.max_size, args.timeout)
+        data, meta = load_input(args.target, args.max_size, args.timeout, args.inspect)
         result = analyze(data, meta)
 
-        if args.run or args.keep:
+        if data is not None and (args.run or args.keep):
             saved = save_copy(data)
             if args.keep:
                 result["saved_to"] = saved
@@ -682,6 +970,8 @@ def main(argv=None):
 
         code = EXIT_FOR_VERDICT[result["verdict"]]
         if args.run:
+            if data is None:
+                raise PipeguardError("refusing to run: this is not a script")
             terminal = open_terminal()
             if terminal is None:
                 raise PipeguardError("no terminal available to confirm, refusing to run")

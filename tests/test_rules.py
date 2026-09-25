@@ -112,5 +112,54 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(pg.compute_verdict(findings, score), "critical")
 
 
+def conn_meta(source, hops=(), tls_error=None, tls=()):
+    return {"source": source, "final_url": source, "kind": None, "size": None,
+            "connection": {"hops": list(hops), "status": 200, "headers": {},
+                           "tls": list(tls), "tls_error": tls_error}}
+
+
+def conn_rules(meta):
+    scanner = pg.Scanner()
+    pg.connection_findings(scanner, meta)
+    return {f["rule"] for f in scanner.findings}
+
+
+class TestSniff(unittest.TestCase):
+    def test_binary_types(self):
+        self.assertEqual(pg.sniff(b"PK\x03\x04rest"), "ZIP archive")
+        self.assertEqual(pg.sniff(b"\x7fELF\x02\x01"), "Linux executable (ELF binary)")
+        self.assertEqual(pg.sniff(b"\x00\x00\x00\x18ftypmp42"), "MP4/MOV video")
+        self.assertEqual(pg.sniff(b"  <!DOCTYPE html><html>"), "HTML web page")
+
+    def test_scripts_pass_through(self):
+        self.assertIsNone(pg.sniff(b"#!/bin/sh\necho hi\n"))
+        self.assertIsNone(pg.sniff(b"set -e\ncurl -fsSL x | tar xz\n", "application/octet-stream"))
+
+
+class TestConnection(unittest.TestCase):
+    def test_plain_http_source(self):
+        self.assertIn("TRN010", conn_rules(conn_meta("http://example.com/i.sh")))
+
+    def test_https_downgrade_redirect(self):
+        hops = [{"status": 301, "from": "https://a.example/i.sh", "to": "http://a.example/i.sh"}]
+        self.assertIn("TRN011", conn_rules(conn_meta("https://a.example/i.sh", hops)))
+
+    def test_suspicious_sources(self):
+        self.assertIn("SRC001", conn_rules(conn_meta("https://45.33.12.9/i.sh")))
+        self.assertIn("SRC002", conn_rules(conn_meta("https://bit.ly/abc")))
+        self.assertIn("SRC003", conn_rules(conn_meta("https://pastebin.com/raw/abc")))
+        self.assertIn("SRC004", conn_rules(conn_meta("https://xn--80ak6aa92e.com/i.sh")))
+        self.assertIn("SRC005", conn_rules(conn_meta("https://example.com:8443/i.sh")))
+        self.assertEqual(conn_rules(conn_meta("https://sh.rustup.rs")), set())
+
+    def test_bad_certificate(self):
+        meta = conn_meta("https://expired.example/i.sh", tls_error=("cert", "certificate has expired"))
+        self.assertIn("TLS001", conn_rules(meta))
+
+    def test_certificate_expiring_soon(self):
+        tls = [{"host": "a.example", "version": "TLSv1.3", "issuer": "X", "days_left": 3}]
+        self.assertIn("TLS003", conn_rules(conn_meta("https://a.example/i.sh", tls=tls)))
+
+
 if __name__ == "__main__":
     unittest.main()
