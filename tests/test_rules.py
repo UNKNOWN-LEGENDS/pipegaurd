@@ -133,7 +133,7 @@ class TestSniff(unittest.TestCase):
 
     def test_scripts_pass_through(self):
         self.assertIsNone(pg.sniff(b"#!/bin/sh\necho hi\n"))
-        self.assertIsNone(pg.sniff(b"set -e\ncurl -fsSL x | tar xz\n", "application/octet-stream"))
+        self.assertIsNone(pg.sniff(b"set -e\ncurl -fsSL x | tar xz\n"))
 
 
 class TestConnection(unittest.TestCase):
@@ -193,6 +193,63 @@ class TestTLSContext(unittest.TestCase):
         self.assertFalse(ctx.verify_flags & flag)                # but not Python-only strictness
         if flag:
             self.assertTrue(pg.tls_context(strict=True).verify_flags & flag)
+
+
+def disguise_rules(text, source, content_type="text/plain", disposition=None, kind=None):
+    headers = {"Content-Type": content_type}
+    if disposition:
+        headers["Content-Disposition"] = disposition
+    meta = conn_meta(source)
+    meta["connection"]["headers"] = headers
+    meta["kind"] = kind
+    scanner = pg.Scanner()
+    if text is not None:
+        scanner.scan(text)
+    pg.disguise_findings(scanner, meta, text)
+    return {f["rule"] for f in scanner.findings}
+
+
+class TestDisguise(unittest.TestCase):
+    SCRIPT = "#!/bin/bash\necho hi\n"
+
+    def test_content_type_never_skips_the_scan(self):
+        # before v0.4.0, Content-Type: image/png made pipegaurd skip the content entirely
+        self.assertIsNone(pg.sniff(b"#!/bin/bash\necho hi\n"))
+
+    def test_script_named_txt(self):
+        self.assertIn("MASK001", disguise_rules(self.SCRIPT, "https://x.example/robots.txt"))
+
+    def test_script_labelled_image(self):
+        self.assertIn("MASK001", disguise_rules(self.SCRIPT, "https://x.example/logo", "image/png"))
+
+    def test_commands_without_shebang_in_txt(self):
+        text = "User-agent: *\necho key >> ~/.ssh/authorized_keys\n"
+        self.assertIn("MASK001", disguise_rules(text, "https://x.example/robots.txt"))
+
+    def test_honest_files_are_not_flagged(self):
+        self.assertEqual(disguise_rules("User-agent: *\nAllow: /\n", "https://x.example/robots.txt"), set())
+        self.assertEqual(disguise_rules(self.SCRIPT, "https://x.example/install.sh"), set())
+        self.assertEqual(disguise_rules(self.SCRIPT, "https://sh.rustup.rs/"), set())
+
+    def test_server_renames_download(self):
+        found = disguise_rules(self.SCRIPT, "https://x.example/report.pdf", "application/pdf",
+                               'attachment; filename="update.sh"')
+        self.assertTrue({"MASK001", "MASK002"} <= found, found)
+
+    def test_binary_named_sh(self):
+        found = disguise_rules(None, "https://x.example/installer.sh", kind="Linux executable (ELF binary)")
+        self.assertIn("MASK003", found)
+
+    def test_double_extension(self):
+        self.assertIn("MASK004", disguise_rules(self.SCRIPT, "https://x.example/invoice.pdf.sh"))
+
+    def test_disguised_sample_file(self):
+        found = {f["rule"] for f in analyze_sample("disguised_robots.txt")["findings"]}
+        self.assertTrue({"MASK001", "PERS001", "PERS002"} <= found, found)
+
+    def test_loopback_http_is_not_flagged(self):
+        self.assertEqual(conn_rules(conn_meta("http://127.0.0.1:8000/robots.txt")), set())
+        self.assertEqual(conn_rules(conn_meta("http://localhost:8000/x.sh")), set())
 
 
 if __name__ == "__main__":

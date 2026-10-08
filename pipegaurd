@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 MAX_SIZE_DEFAULT = 5 * 1024 * 1024  # 5 MB is far bigger than any sane installer
 TIMEOUT_DEFAULT = 20
@@ -209,6 +209,10 @@ META_RULES = {r.id: r for r in [
     Rule("SRC003", "medium", "source", "Hosted on an anonymous paste/file-drop service", None),
     Rule("SRC004", "medium", "source", "Internationalized domain (possible look-alike)", None),
     Rule("SRC005", "low", "source", "Uses a non-standard port", None),
+    Rule("MASK001", "high", "disguise", "Script disguised as a different file type", None),
+    Rule("MASK002", "medium", "disguise", "Server sends a different filename than the URL shows", None),
+    Rule("MASK003", "high", "disguise", "Named like a script, but it's actually a binary", None),
+    Rule("MASK004", "medium", "disguise", "Double file extension (classic disguise trick)", None),
 ]}
 
 # Lines that only print a message. For these, low/medium rules ignore text
@@ -432,8 +436,13 @@ SIGNATURES = [
 ]
 
 
-def sniff(head, content_type=""):
-    """Return a description if `head` is clearly NOT a script, else None."""
+def sniff(head):
+    """Return a description if `head` is clearly NOT a script, else None.
+
+    Only the bytes decide. Names and Content-Type headers are claims an
+    attacker controls, so they are checked separately for mismatches
+    (see disguise_findings) but never used to skip the scan.
+    """
     for magic, name in SIGNATURES:
         if head.startswith(magic):
             return name
@@ -446,9 +455,6 @@ def sniff(head, content_type=""):
         return "HTML web page"
     if b"\x00" in head:
         return "binary data"
-    ctype = (content_type or "").split(";")[0].strip().lower()
-    if ctype.startswith(("video/", "audio/", "image/", "font/")):
-        return "%s file" % ctype
     return None
 
 
@@ -539,7 +545,7 @@ def fetch_url(url, max_size, timeout, inspect_only):
             meta["size"] = length
 
             head = response.read(SNIFF_BYTES)
-            kind = sniff(head, conn["headers"].get("Content-Type"))
+            kind = sniff(head)
             if kind:
                 meta["kind"] = kind                      # stop: not a script
             elif inspect_only:
@@ -672,6 +678,12 @@ def load_input(target, max_size, timeout, inspect_only=False):
 
 def finish_load(data, meta):
     if data is not None and not data.strip():
+        if meta.get("source") == "<stdin>":
+            raise PipegaurdError(
+                "nothing came through the pipe.\n"
+                "  If you used curl -O or -o, curl saved the file to disk and sent nothing to pipegaurd.\n"
+                "  Either drop -O:      curl -fsSL URL | pipegaurd\n"
+                "  or check the file:   pipegaurd ./FILE")
         raise PipegaurdError("the script is empty")
     return data, meta
 
@@ -690,6 +702,17 @@ def host_in(host, domains):
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
+def is_loopback(host):
+    """Traffic to your own machine never crosses a network."""
+    host = (host or "").strip("[]").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def is_ip(host):
     try:
         ipaddress.ip_address(host)
@@ -704,7 +727,7 @@ def connection_findings(scanner, meta):
         return
     chain = [meta["source"]] + [hop["to"] for hop in conn["hops"]]
 
-    if chain[0].lower().startswith("http://"):
+    if chain[0].lower().startswith("http://") and not is_loopback(urllib.parse.urlparse(chain[0]).hostname):
         scanner.add(META_RULES["TRN010"], 0, chain[0])
     for hop in conn["hops"]:
         if hop["from"].lower().startswith("https://") and hop["to"].lower().startswith("http://"):
@@ -721,6 +744,8 @@ def connection_findings(scanner, meta):
         if not host or host in seen:
             continue
         seen.add(host)
+        if is_loopback(host):
+            continue
         if is_ip(host):
             scanner.add(META_RULES["SRC001"], 0, url)
         if host_in(host, SHORTENERS):
@@ -747,6 +772,90 @@ def connection_findings(scanner, meta):
             scanner.add(META_RULES["TLS004"], 0, "%s uses %s" % (info["host"], info["version"]))
         if info.get("days_left") is not None and info["days_left"] < 14:
             scanner.add(META_RULES["TLS003"], 0, "%s: %d days left" % (info["host"], info["days_left"]))
+
+
+# --------------------------------------------------------------------------
+# Disguise checks: does the file's name or label match what it really is?
+# --------------------------------------------------------------------------
+
+SCRIPT_EXTS = {"sh", "bash", "zsh", "ksh", "dash", "fish", "command", "run"}
+INNOCENT_EXTS = {"txt", "text", "md", "log", "csv", "tsv", "json", "xml", "yml", "yaml", "ini", "cfg",
+                 "html", "htm", "css", "svg", "jpg", "jpeg", "png", "gif", "webp", "bmp", "ico",
+                 "pdf", "doc", "docx", "xls", "xlsx", "odt", "mp3", "mp4", "mkv", "wav", "zip", "iso"}
+INNOCENT_TYPES = ("image/", "audio/", "video/", "font/", "application/pdf", "application/json",
+                  "application/zip", "text/csv", "text/css", "text/html")
+
+
+def extension(name):
+    base = (name or "").rstrip("/").rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[-1].lower() if "." in base.strip(".") else ""
+
+
+def names_for(meta):
+    """Every name this content has been given: URL path(s), file path, Content-Disposition."""
+    names = []
+    conn = meta.get("connection")
+    if conn:
+        for url in [meta["source"], meta.get("final_url")]:
+            path = urllib.parse.urlparse(url or "").path
+            if path and path != "/" and path not in names:
+                names.append(path)
+        sent = disposition_filename(conn["headers"].get("Content-Disposition"))
+        if sent:
+            names.append(sent)
+    elif meta.get("source") and meta["source"] != "<stdin>":
+        names.append(meta["source"])
+    return names
+
+
+def shebang_of(text):
+    first = text.lstrip("\ufeff").split("\n", 1)[0].strip()
+    return first if first.startswith("#!") else None
+
+
+def disguise_findings(scanner, meta, text):
+    names = names_for(meta)
+    conn = meta.get("connection") or {}
+    ctype = (conn.get("headers", {}).get("Content-Type") or "").split(";")[0].strip().lower()
+    kind = meta.get("kind")
+
+    # Binary pretending to be a script (data is None, sniff found a binary).
+    if kind and kind not in ("HTML web page",) and not kind.startswith(("not scanned", "blocked", "file too large")):
+        for name in names:
+            if extension(name) in SCRIPT_EXTS:
+                scanner.add(META_RULES["MASK003"], 0, "%s is really a %s" % (name.rsplit("/", 1)[-1], kind))
+                break
+
+    for name in names:
+        base = name.rsplit("/", 1)[-1]
+        parts = base.lower().split(".")
+        if len(parts) >= 3 and parts[-2] in INNOCENT_EXTS and parts[-1] in SCRIPT_EXTS | {"exe", "bin", "elf"}:
+            scanner.add(META_RULES["MASK004"], 0, base)
+
+    if conn:
+        sent = disposition_filename(conn.get("headers", {}).get("Content-Disposition"))
+        url_ext = extension(urllib.parse.urlparse(meta.get("final_url") or meta["source"]).path)
+        if sent and extension(sent) != url_ext:
+            scanner.add(META_RULES["MASK002"], 0, "URL ends in '.%s' but the server names it '%s'"
+                        % (url_ext or "(none)", sent))
+
+    if kind is not None or text is None:
+        return
+    # Script content behind an innocent-looking name or label?
+    bang = shebang_of(text)
+    script_like = bang is not None or any(f["severity"] in ("high", "critical") for f in scanner.findings
+                                          if f["category"] not in ("transport", "tls", "source", "disguise"))
+    if not script_like:
+        return
+    what = ("starts with '%s'" % bang) if bang else "contains shell commands"
+    for name in names:
+        ext = extension(name)
+        if ext in INNOCENT_EXTS:
+            scanner.add(META_RULES["MASK001"], 0, "named '%s' (.%s) but %s"
+                        % (name.rsplit("/", 1)[-1], ext, what))
+            return
+    if ctype.startswith(INNOCENT_TYPES):
+        scanner.add(META_RULES["MASK001"], 0, "server labels it '%s' but it %s" % (ctype, what))
 
 
 def notices_for(data, text):
@@ -977,6 +1086,7 @@ def analyze(data, meta):
         text = data.decode("utf-8", errors="replace")
         scanner.scan(text)
     connection_findings(scanner, meta)
+    disguise_findings(scanner, meta, text if data is not None else None)
     score = compute_score(scanner.findings)
     return {
         "tool": "pipegaurd",

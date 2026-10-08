@@ -59,7 +59,7 @@ pipegaurd --version
 
 ## What it detects
 
-57 checks across these categories:
+61 checks across these categories:
 
 | Category | Examples |
 |---|---|
@@ -72,6 +72,9 @@ pipegaurd --version
 | **Network / exfiltration** | reverse shells, crypto miners, reading private keys and credentials, uploading files or environment variables |
 | **Transport & TLS** | plain HTTP, `curl -k`, HTTPS-to-HTTP redirects, invalid or expiring certificates, outdated TLS |
 | **Source** | raw IP hosts, URL shorteners, anonymous paste sites, look-alike (punycode) domains, unusual ports |
+| **Disguise** | scripts hiding behind innocent names or labels (`robots.txt`, `logo.png`, `Content-Type: image/png`), servers that rename the download, double extensions (`invoice.pdf.sh`), binaries named `.sh` |
+
+pipegaurd judges a file by its **bytes**, never by its name or the server's `Content-Type`. Those are claims an attacker controls, so they're only compared against the real content to catch disguises.
 
 It also recognises files that aren't scripts (archives, binaries, videos, HTML pages) from their first 4 KB and stops immediately, so pointing it at a 2 GB ISO takes under a second.
 
@@ -141,6 +144,13 @@ python3 -m unittest discover tests
 Test samples in `tests/samples/` are **only ever scanned, never executed**, and point at fake hosts and fake keys.
 
 Adding a rule is one entry in the `RULES` list plus a test case.
+
+To try the disguise checks against a deliberately dishonest server (localhost only, nothing is executed):
+
+```bash
+python3 tests/disguise_server.py        # terminal 1
+pipegaurd http://127.0.0.1:8000/        # terminal 2: lists the test URLs
+```
 
 ## License
 

