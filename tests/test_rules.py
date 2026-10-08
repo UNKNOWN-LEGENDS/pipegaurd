@@ -1,4 +1,4 @@
-"""Tests for pipeguard. Run from the repo root:  python3 -m unittest discover tests"""
+"""Tests for pipegaurd. Run from the repo root:  python3 -m unittest discover tests"""
 
 import importlib.machinery
 import importlib.util
@@ -8,9 +8,9 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SAMPLES = os.path.join(HERE, "samples")
 
-# pipeguard has no .py extension, so load it by path.
-_loader = importlib.machinery.SourceFileLoader("pipeguard", os.path.join(HERE, "..", "pipeguard"))
-_spec = importlib.util.spec_from_loader("pipeguard", _loader)
+# pipegaurd has no .py extension, so load it by path.
+_loader = importlib.machinery.SourceFileLoader("pipegaurd", os.path.join(HERE, "..", "pipegaurd"))
+_spec = importlib.util.spec_from_loader("pipegaurd", _loader)
 pg = importlib.util.module_from_spec(_spec)
 _loader.exec_module(pg)
 
@@ -159,6 +159,28 @@ class TestConnection(unittest.TestCase):
     def test_certificate_expiring_soon(self):
         tls = [{"host": "a.example", "version": "TLSv1.3", "issuer": "X", "days_left": 3}]
         self.assertIn("TLS003", conn_rules(conn_meta("https://a.example/i.sh", tls=tls)))
+
+
+class TestResolveTarget(unittest.TestCase):
+    def test_bare_domains_become_https(self):
+        for typed in ("google.com", "www.google.com", "get.docker.com", "sh.rustup.rs",
+                      "astral.sh/uv/install.sh", "example.com:8443/i.sh", "45.33.12.9/i.sh"):
+            self.assertEqual(pg.resolve_target(typed), ("url", "https://" + typed), typed)
+
+    def test_full_urls_untouched(self):
+        self.assertEqual(pg.resolve_target("http://neverssl.com"), ("url", "http://neverssl.com"))
+        self.assertEqual(pg.resolve_target("ftp://x.example"), ("url", "ftp://x.example"))
+
+    def test_paths_and_existing_files_stay_files(self):
+        self.assertEqual(pg.resolve_target("./install.sh")[0], "file")
+        self.assertEqual(pg.resolve_target("/tmp/x.sh")[0], "file")
+        sample = os.path.join(SAMPLES, "benign_simple.sh")
+        self.assertEqual(pg.resolve_target(sample), ("file", sample))
+
+    def test_plain_words_are_not_urls(self):
+        self.assertEqual(pg.resolve_target("install")[0], "file")
+        self.assertEqual(pg.resolve_target("localhost")[0], "file")
+        self.assertIsNone(pg.resolve_target(None)[1])
 
 
 if __name__ == "__main__":

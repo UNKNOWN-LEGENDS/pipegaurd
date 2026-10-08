@@ -29,6 +29,10 @@ That runs hundreds of lines of code from the internet as root, usually without a
 # check a script
 pipegaurd https://example.com/install.sh
 
+# bare domains work too (always upgraded to https://, never http://)
+pipegaurd get.docker.com
+pipegaurd astral.sh/uv/install.sh
+
 # the drop-in replacement for "| bash"
 curl -fsSL https://example.com/install.sh | pipegaurd --run
 
