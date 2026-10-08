@@ -1,13 +1,13 @@
-# pipeguard
+# pipegaurd
 
 **Look before you pipe.**
 
-`pipeguard` checks a shell script *before* you run it with `curl ... | bash`. It flags backdoors, persistence, obfuscated payloads, destructive commands, and insecure downloads, then lets you run the exact copy it analyzed, and nothing else.
+`pipegaurd` checks a shell script *before* you run it with `curl ... | bash`. It flags backdoors, persistence, obfuscated payloads, destructive commands, and insecure downloads, then lets you run the exact copy it analyzed, and nothing else.
 
 Zero dependencies. One file. Works on any Linux with Python 3.8+.
 
 <!-- Record with: asciinema rec demo.cast && agg demo.cast demo.gif -->
-![pipeguard demo](demo.gif)
+![pipegaurd demo](demo.gif)
 
 ---
 
@@ -21,33 +21,33 @@ curl -fsSL https://example.com/install.sh | sudo bash
 
 That runs hundreds of lines of code from the internet as root, usually without anyone reading them. The server can change the script at any time, and a script can even detect that it is being piped into a shell and serve a different payload than the one you'd see in a browser.
 
-`pipeguard` sits in the middle: it downloads the script, tells you what it actually does, and only runs it if you say so.
+`pipegaurd` sits in the middle: it downloads the script, tells you what it actually does, and only runs it if you say so.
 
 ## Quick start
 
 ```bash
 # check a script
-pipeguard https://example.com/install.sh
+pipegaurd https://example.com/install.sh
 
 # the drop-in replacement for "| bash"
-curl -fsSL https://example.com/install.sh | pipeguard --run
+curl -fsSL https://example.com/install.sh | pipegaurd --run
 
 # check a local file
-pipeguard ./install.sh
+pipegaurd ./install.sh
 
 # check only the connection (redirects, TLS, headers) without downloading
-pipeguard --inspect https://example.com/some-download.iso
+pipegaurd --inspect https://example.com/some-download.iso
 ```
 
 ## Installation
 
-pipeguard is a single Python file. Yes, we see the irony: please don't pipe our installer into bash.
+pipegaurd is a single Python file. Yes, we see the irony: please don't pipe our installer into bash.
 
 ```bash
-git clone https://github.com/UNKNOWN-LEGENDS/pipeguard.git
-cd pipeguard
-sudo install -m 755 pipeguard /usr/local/bin/pipeguard
-pipeguard --version
+git clone https://github.com/UNKNOWN-LEGENDS/pipegaurd.git
+cd pipegaurd
+sudo install -m 755 pipegaurd /usr/local/bin/pipegaurd
+pipegaurd --version
 ```
 
 **Requirement:** Python 3.8 or newer. Most distros ship it; on minimal images install it first (`apt install python3`, `dnf install python3`, `apk add python3`, `pacman -S python`).
@@ -102,10 +102,10 @@ It also recognises files that aren't scripts (archives, binaries, videos, HTML p
 | `--max-size BYTES` | Refuse scripts larger than this (default 5 MB). |
 | `--timeout SEC` | Network timeout (default 20). |
 
-**Exit codes:** `0` clean/low, `1` medium, `2` high/critical, `3` error. With `--run`, the script's own exit code is returned. This makes pipeguard usable in scripts and CI:
+**Exit codes:** `0` clean/low, `1` medium, `2` high/critical, `3` error. With `--run`, the script's own exit code is returned. This makes pipegaurd usable in scripts and CI:
 
 ```bash
-pipeguard --json https://example.com/install.sh | jq -r .verdict
+pipegaurd --json https://example.com/install.sh | jq -r .verdict
 ```
 
 ## How it works
@@ -118,7 +118,7 @@ pipeguard --json https://example.com/install.sh | jq -r .verdict
 
 ## Limitations
 
-pipeguard is a seatbelt, not a guarantee.
+pipegaurd is a seatbelt, not a guarantee.
 
 - It's **static pattern matching**. A determined attacker can build commands from variables or fetch code at runtime in ways regexes won't catch.
 - It **can't see inside binaries** a script downloads, only the script itself.

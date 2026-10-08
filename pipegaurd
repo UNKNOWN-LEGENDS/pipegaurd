@@ -1,0 +1,1004 @@
+#!/usr/bin/env python3
+"""
+pipeguard - look before you pipe.
+
+Static analysis for shell scripts you are about to run with `curl ... | bash`.
+It downloads (or reads) a script, flags risky patterns, and - if you choose to
+run it - executes the exact bytes it analyzed, never a fresh download.
+
+Zero dependencies: Python 3.8+ standard library only.
+License: MIT
+"""
+
+import argparse
+import base64
+import binascii
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+__version__ = "0.2.0"
+
+MAX_SIZE_DEFAULT = 5 * 1024 * 1024  # 5 MB is far bigger than any sane installer
+TIMEOUT_DEFAULT = 20
+MAX_DECODE_DEPTH = 3                # how many layers of base64 we peel back
+MAX_SHOWN_PER_RULE = 3              # occurrences printed per rule in the report
+LONG_LINE = 1000
+
+SEVERITIES = ["low", "medium", "high", "critical"]
+SEVERITY_WEIGHT = {"low": 2, "medium": 8, "high": 20, "critical": 40}
+
+EXIT_OK, EXIT_WARN, EXIT_DANGER, EXIT_ERROR = 0, 1, 2, 3
+
+
+# --------------------------------------------------------------------------
+# Rules
+# --------------------------------------------------------------------------
+
+class Rule:
+    def __init__(self, rule_id, severity, category, title, pattern, flags=0):
+        self.id = rule_id
+        self.severity = severity
+        self.category = category
+        self.title = title
+        self.regex = re.compile(pattern, flags) if pattern else None
+
+
+# Start of a command: beginning of line or after whitespace / ; & | ( ` { !
+B = r"(?:^|(?<=[\s;&|(`{!]))"
+
+
+def cmd(pattern):
+    """Match `pattern` only where a new command/word starts."""
+    return B + "(?:" + pattern + ")"
+
+
+SHELLS = r"(?:ba|da|z|k|fi)?sh|python3?|perl|ruby"
+
+RULES = [
+    # ---- privilege -------------------------------------------------------
+    Rule("PRIV001", "medium", "privilege", "Runs commands as root with sudo",
+         cmd(r"sudo\b")),
+    Rule("PRIV002", "medium", "privilege", "Switches user with su",
+         cmd(r"su(?:\s+(?:-|root\b)|\s*$)")),
+    Rule("PRIV003", "medium", "privilege", "Uses another privilege tool (pkexec/doas)",
+         cmd(r"(?:pkexec|doas)\b")),
+    Rule("PRIV004", "high", "privilege", "Sets the setuid/setgid bit on a file",
+         r"\bchmod\s+(?:-\w+\s+)*(?:[ugoa]*\+[rwxX]*s|0?[2-7][0-7]{3})\b"),
+    Rule("PRIV005", "high", "privilege", "Modifies sudo permissions",
+         r"/etc/sudoers|\bvisudo\b|NOPASSWD"),
+
+    # ---- destructive -----------------------------------------------------
+    Rule("DEST001", "critical", "destructive",
+         "Recursively deletes a system or home directory",
+         r"\brm\s+(?:-[-\w]+\s+)*(?:-\w*[rR]\w*|--recursive)\s+(?:-[-\w]+\s+)*"
+         r"[\"']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?|/(?:home|etc|usr|boot|var|bin|lib|opt|root)/?\*?)"
+         r"[\"']?(?:\s|$|;|&|\|)"),
+    Rule("DEST002", "critical", "destructive", "Disables rm's protection for /",
+         r"--no-preserve-root"),
+    Rule("DEST003", "critical", "destructive", "Writes directly to a raw disk device",
+         r"(?:\bof=|>\s*)/dev/(?:sd[a-z]|nvme\d|hd[a-z]|vd[a-z]|xvd[a-z]|mmcblk\d)"),
+    Rule("DEST004", "critical", "destructive", "Formats or wipes a filesystem",
+         cmd(r"(?:mkfs(?:\.\w+)?|wipefs|mkswap)\s") + r"|\bshred\b[^;&|\n]*/dev/"),
+    Rule("DEST005", "critical", "destructive", "Contains a fork bomb",
+         r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
+
+    # ---- persistence -----------------------------------------------------
+    Rule("PERS001", "high", "persistence",
+         "Touches SSH authorized_keys (possible backdoor)",
+         r"authorized_keys"),
+    Rule("PERS002", "high", "persistence", "Creates or edits scheduled cron jobs",
+         cmd(r"crontab\b") + r"|/etc/cron|/var/spool/cron|/etc/anacrontab"),
+    Rule("PERS003", "medium", "persistence", "Installs or enables a systemd service",
+         r"\bsystemctl\s+(?:--\S+\s+)*enable\b|/etc/systemd/system/|\.config/systemd/user/"),
+    Rule("PERS004", "medium", "persistence", "Edits shell startup files",
+         r"(?:>>?|\btee\s+(?:-a\s+)?|\bsed\s+-i\S*\s+.*)\s*[\"']?(?:~|\$\{?HOME\}?)/"
+         r"\.(?:bashrc|bash_profile|bash_login|profile|zshrc|zprofile|zshenv|zlogin|config/fish/config\.fish)\b"
+         r"|/etc/(?:profile|bash\.bashrc|zsh/zshrc|environment)\b"),
+    Rule("PERS005", "high", "persistence", "Uses LD_PRELOAD library injection",
+         r"/etc/ld\.so\.preload|\bLD_PRELOAD="),
+    Rule("PERS006", "medium", "persistence", "Adds a desktop autostart entry",
+         r"\.config/autostart|/etc/xdg/autostart"),
+    Rule("PERS007", "medium", "persistence", "Creates or modifies user accounts",
+         cmd(r"(?:useradd|adduser|usermod|chpasswd)\b") + r"|>>?\s*/etc/(?:passwd|group)\b"),
+    Rule("PERS008", "medium", "persistence", "Adds legacy init/boot scripts",
+         r"/etc/rc\.local|/etc/init\.d/"),
+    Rule("PERS009", "medium", "persistence", "Loads a kernel module",
+         cmd(r"(?:insmod|modprobe)\s") + r"|/etc/modules-load\.d/"),
+
+    # ---- second stage ----------------------------------------------------
+    Rule("NET001", "high", "second-stage", "Downloads and runs another script",
+         r"\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:" + SHELLS + r")\b"
+         r"|\b(?:" + SHELLS + r")\s+(?:-\w+\s+)*[\"']?\$\(\s*(?:curl|wget)\b"
+         r"|\b(?:" + SHELLS + r")\s+<\(\s*(?:curl|wget)\b"
+         r"|\bsource\s+<\(\s*(?:curl|wget)\b"),
+    Rule("NET002", "medium", "second-stage", "Makes a file in a temp directory executable",
+         r"\bchmod\s+(?:-\w+\s+)*(?:\+x|[ugoa]*\+\w*x\w*|[0-7]{3,4})\s+[\"']?(?:/tmp|/var/tmp|/dev/shm)/"),
+    Rule("NET003", "high", "second-stage", "Uses /dev/shm (a common malware hiding spot)",
+         r"/dev/shm/"),
+    Rule("NET005", "medium", "second-stage", "Downloads from a raw IP address instead of a domain",
+         r"\b(?:curl|wget)\b[^;&|\n]*\bhttps?://\d{1,3}(?:\.\d{1,3}){3}\b"),
+    Rule("NET004", "high", "second-stage", "Downloads to a hidden file",
+         r"\b(?:curl|wget)\b[^;&|\n]*(?:-o|-O|--output)\s*[\"']?(?:\S*/)?\.[\w.-]+[\"']?(?:\s|$)"),
+
+    # ---- obfuscation -----------------------------------------------------
+    Rule("OBF001", "medium", "obfuscation", "Uses eval to run dynamically built code",
+         cmd(r"eval\b")),
+    Rule("OBF002", "high", "obfuscation", "Decodes base64 content at runtime",
+         r"\bbase64\s+(?:-\w+\s+)*(?:-[a-zA-Z]*[dD][a-zA-Z]*\b|--decode\b)"
+         r"|\bopenssl\s+(?:base64|enc)\b[^;&|\n]*\s-d\b"),
+    Rule("OBF003", "high", "obfuscation", "Contains hex-escaped strings (hidden text)",
+         r"(?:\\x[0-9a-fA-F]{2}){8,}"),
+    Rule("OBF004", "medium", "obfuscation", "Reverses or hex-decodes text at runtime",
+         r"\bxxd\s+(?:-\w+\s+)*-r|\|\s*rev\b"),
+
+    # ---- tampering -------------------------------------------------------
+    Rule("TAMP001", "high", "tampering", "Disables SELinux or AppArmor",
+         r"\bsetenforce\s+0|SELINUX=(?:disabled|permissive)|\baa-teardown\b"
+         r"|\bsystemctl\s+(?:\S+\s+)*?(?:stop|disable|mask)\s+(?:\S+\s+)*?apparmor"),
+    Rule("TAMP002", "high", "tampering", "Disables or flushes the firewall",
+         r"\bufw\s+disable|\biptables\s+(?:-\w+\s+)*-F\b|\biptables\s+-P\s+INPUT\s+ACCEPT"
+         r"|\bnft\s+flush\s+ruleset"
+         r"|\bsystemctl\s+(?:\S+\s+)*?(?:stop|disable|mask)\s+(?:\S+\s+)*?(?:firewalld|ufw|nftables|iptables)\b"),
+    Rule("TAMP003", "high", "tampering", "Clears or disables shell history (hiding tracks)",
+         r"\bhistory\s+-c\b|\bunset\s+HISTFILE\b|HISTFILE=/dev/null|\bHISTSIZE=0\b|\bset\s+\+o\s+history"),
+    Rule("TAMP004", "high", "tampering", "Deletes or truncates system logs",
+         r"\b(?:rm|shred|truncate)\b[^;&|\n]*/var/log/|(?<!>)>\s*/var/log/"
+         r"|\bjournalctl\b[^;&|\n]*--(?:vacuum|rotate)"),
+    Rule("TAMP005", "high", "tampering", "Turns off package signature checks",
+         r"--nogpgcheck|--allow-unauthenticated|--allow-insecure-repositories"
+         r"|SigLevel\s*=\s*Never|\[trusted=yes\]|gpgcheck\s*=\s*0"),
+    Rule("TAMP006", "medium", "tampering", "Changes DNS or hosts resolution",
+         r"(?:>>?|\btee\b[^;&|\n]*)\s*/etc/(?:hosts|resolv\.conf)\b"),
+    Rule("TAMP007", "high", "tampering", "Stops security or monitoring tools",
+         r"\b(?:pkill|killall|kill)\b[^;&|\n]*(?:auditd|clamd|falco|osquery|wazuh|ossec)"
+         r"|\bsystemctl\s+(?:\S+\s+)*?(?:stop|disable|mask)\s+(?:\S+\s+)*?(?:auditd|clamav|falco|wazuh|osqueryd)"),
+
+    # ---- network / exfiltration -----------------------------------------
+    Rule("NET010", "critical", "network", "Opens a reverse shell or raw network socket",
+         r"/dev/(?:tcp|udp)/|\bnc(?:at)?\b[^;&|\n]*\s-\w*[ec]\b|\bsocat\b[^;&|\n]*\bexec:"
+         r"|\b(?:ba)?sh\s+-i\s*[>&]+|\bmkfifo\b[^;\n]*\b(?:nc|ncat|telnet)\b"),
+    Rule("NET011", "critical", "network", "References crypto-mining software",
+         r"\bxmrig\b|stratum\+(?:tcp|ssl)://|\bminerd\b|\bcpuminer\b|\bnanopool\b|\bnicehash\b",
+         re.IGNORECASE),
+    Rule("EXF001", "high", "exfiltration", "Accesses private keys or credential files",
+         r"\.ssh/id_\w+\b(?!\.pub)|\.aws/credentials|\.gnupg/|\.netrc\b|\.docker/config\.json"
+         r"|\.kube/config|\.config/gh/hosts|/etc/shadow\b|\.git-credentials|\.password-store"),
+    Rule("EXF002", "high", "exfiltration", "Uploads local files or data to a server",
+         r"\bcurl\b[^;&|\n]*(?:\s(?:-d|--data(?:-binary|-raw|-urlencode)?)\s*[\"']?@"
+         r"|\s-F\s*[\"']?[\w-]+=@|\s(?:-T|--upload-file)\s)|\bwget\b[^;&|\n]*--post-file"),
+    Rule("EXF003", "critical", "exfiltration", "Uploads SSH keys or credentials to a server",
+         r"\b(?:curl|wget)\b[^;&|\n]*(?:@|--post-file=?\s*)[\"']?\S*"
+         r"(?:\.ssh/|\.aws/|\.gnupg/|/etc/shadow|\.netrc|\.kube/|\.docker/config|\.git-credentials)"),
+    Rule("EXF004", "high", "exfiltration", "Sends environment variables off the machine",
+         r"\b(?:printenv|env)\b\s*\|\s*(?:curl|wget|nc|base64)\b"
+         r"|\b(?:curl|wget)\b[^;&|\n]*\$\((?:printenv|env)\b"),
+
+    # ---- transport -------------------------------------------------------
+    Rule("TRN001", "medium", "transport", "Disables TLS certificate checks",
+         r"\bcurl\b[^;&|\n]*\s(?:-\w*k\b|--insecure\b)|\bwget\b[^;&|\n]*--no-check-certificate"),
+    Rule("TRN002", "medium", "transport", "Downloads over unencrypted HTTP",
+         r"\b(?:curl|wget)\b[^;&|\n]*\bhttp://(?!(?:localhost|127\.0\.0\.1|\[::1\]))"),
+]
+
+# Findings that come from analysis logic rather than a single regex.
+META_RULES = {r.id: r for r in [
+    Rule("OBF005", "low", "obfuscation", "Very long line (can hide code off-screen)", None),
+    Rule("OBF006", "high", "obfuscation", "Hidden text encoded in base64", None),
+    Rule("TRN010", "high", "transport", "Script was fetched over unencrypted HTTP", None),
+    Rule("TRN011", "high", "transport", "HTTPS request was redirected to plain HTTP", None),
+    Rule("TRN012", "low", "transport", "Request was redirected to a different host", None),
+    Rule("TLS001", "critical", "tls", "TLS certificate is invalid - download blocked", None),
+    Rule("TLS002", "high", "tls", "TLS handshake failed - download blocked", None),
+    Rule("TLS003", "low", "tls", "TLS certificate expires within 14 days", None),
+    Rule("TLS004", "high", "tls", "Server uses an outdated TLS version", None),
+    Rule("SRC001", "medium", "source", "Hosted on a raw IP address, not a domain", None),
+    Rule("SRC002", "medium", "source", "Uses a URL shortener that hides the real destination", None),
+    Rule("SRC003", "medium", "source", "Hosted on an anonymous paste/file-drop service", None),
+    Rule("SRC004", "medium", "source", "Internationalized domain (possible look-alike)", None),
+    Rule("SRC005", "low", "source", "Uses a non-standard port", None),
+]}
+
+# Lines that only print a message. For these, low/medium rules ignore text
+# inside quotes, so `echo "please run with sudo"` isn't flagged.
+# High/critical rules always see the full line.
+MESSAGE_CMD = re.compile(
+    r"^\s*(?:echo|printf|say|info|warn|warning|err|error|log|msg|note|abort|die|fatal|ohai|puts)\b")
+
+B64_BLOB = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+URL_RE = re.compile(r"https?://[^\s\"'<>`;|)$\\]+")  # stops at ${VARS} too
+
+
+# --------------------------------------------------------------------------
+# Text helpers
+# --------------------------------------------------------------------------
+
+def logical_lines(text):
+    """Yield (first_line_number, line), joining backslash-continued lines."""
+    buf, start = [], None
+    for number, raw in enumerate(text.splitlines(), 1):
+        if start is None:
+            start = number
+        stripped = raw.rstrip()
+        trailing = len(stripped) - len(stripped.rstrip("\\"))
+        if trailing % 2 == 1:          # odd count of "\" = line continues
+            buf.append(stripped[:-1])
+            continue
+        buf.append(raw)
+        yield start, " ".join(buf)
+        buf, start = [], None
+    if buf:
+        yield start, " ".join(buf)
+
+
+def strip_comment(line):
+    """Remove a trailing shell comment, respecting quotes and escapes."""
+    in_single = in_double = escaped = False
+    prev = " "
+    for i, ch in enumerate(line):
+        if escaped:
+            escaped = False
+        elif ch == "\\" and not in_single:
+            escaped = True
+        elif ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double and (prev.isspace() or prev in ";&|("):
+            return line[:i]
+        prev = ch
+    return line
+
+
+def mask_quotes(line):
+    """Drop the contents of quoted strings: echo "use sudo" -> echo "" """
+    out = []
+    in_single = in_double = escaped = False
+    for ch in line:
+        inside = in_single or in_double
+        if escaped:
+            escaped = False
+            if not inside:
+                out.append(ch)
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            if not inside:
+                out.append(ch)
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+        elif not inside:
+            out.append(ch)
+    return "".join(out)
+
+
+def try_decode_base64(blob):
+    """Return decoded text if `blob` is base64 hiding readable text, else None."""
+    core = blob.rstrip("=")
+    if len(core) < 40:
+        return None
+    padded = core + "=" * (-len(core) % 4)
+    try:
+        data = base64.b64decode(padded, validate=True)
+        text = data.decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    if not text:
+        return None
+    printable = sum(1 for c in text if c.isprintable() or c in "\n\r\t")
+    if printable / len(text) < 0.95 or not re.search(r"\s", text):
+        return None     # binary junk or a single token: not hidden commands
+    return text
+
+
+def snippet(line, limit=110):
+    line = " ".join(line.split())
+    return line if len(line) <= limit else line[:limit - 3] + "..."
+
+
+# --------------------------------------------------------------------------
+# Scanner
+# --------------------------------------------------------------------------
+
+class Scanner:
+    def __init__(self):
+        self.findings = []
+        self.urls = []
+
+    def add(self, rule, line, code, context=None):
+        self.findings.append({
+            "rule": rule.id,
+            "severity": rule.severity,
+            "category": rule.category,
+            "title": rule.title,
+            "line": line,
+            "code": snippet(code),
+            "context": context,
+        })
+
+    def scan(self, text, depth=0, outer_line=None):
+        for number, raw in logical_lines(text):
+            line_no = outer_line or number
+            context = "decoded from base64 on line %d" % outer_line if outer_line else None
+            code = strip_comment(raw)
+            if not code.strip():
+                continue
+
+            for url in URL_RE.findall(code):
+                if url not in self.urls:
+                    self.urls.append(url.rstrip(".,"))
+
+            masked = mask_quotes(code) if MESSAGE_CMD.match(code) else code
+            for rule in RULES:
+                target = code if rule.severity in ("high", "critical") else masked
+                if rule.regex.search(target):
+                    self.add(rule, line_no, raw, context)
+
+            if len(code) > LONG_LINE:
+                self.add(META_RULES["OBF005"], line_no, raw[:80], context)
+
+            if depth < MAX_DECODE_DEPTH:
+                for match in B64_BLOB.finditer(code):
+                    decoded = try_decode_base64(match.group(0))
+                    if decoded:
+                        self.add(META_RULES["OBF006"], line_no,
+                                 "decodes to: " + decoded, context)
+                        self.scan(decoded, depth + 1, line_no)
+        return self
+
+
+def compute_score(findings):
+    """Each rule counts once, so 40x `sudo` doesn't outweigh one reverse shell."""
+    per_rule = {f["rule"]: f["severity"] for f in findings}
+    return min(sum(SEVERITY_WEIGHT[s] for s in per_rule.values()), 100)
+
+
+def compute_verdict(findings, score):
+    if not findings:
+        return "clean"
+    if score < 10:
+        band = "low"
+    elif score < 30:
+        band = "medium"
+    elif score < 60:
+        band = "high"
+    else:
+        band = "critical"
+    worst = max(findings, key=lambda f: SEVERITIES.index(f["severity"]))["severity"]
+    return max(band, worst, key=SEVERITIES.index)
+
+
+VERDICT_TEXT = {
+    "clean": "No risky patterns found. A good sign, not a guarantee.",
+    "low": "Minor findings. Probably fine, but skim the flagged lines.",
+    "medium": "Review the flagged lines. Legit installers often do this too (sudo, shell config edits).",
+    "high": "Risky behaviour found. Only run this if you trust the source and understand the flagged lines.",
+    "critical": "Dangerous patterns found. Do NOT run this unless you fully understand every flagged line.",
+}
+
+EXIT_FOR_VERDICT = {"clean": EXIT_OK, "low": EXIT_OK, "medium": EXIT_WARN,
+                    "high": EXIT_DANGER, "critical": EXIT_DANGER}
+
+
+# --------------------------------------------------------------------------
+# Input: fetch, sniff, and stop early on anything that isn't a script
+# --------------------------------------------------------------------------
+
+class PipeguardError(Exception):
+    pass
+
+
+SNIFF_BYTES = 4096   # we look at this much before deciding whether to read more
+
+# File "magic numbers": the first bytes identify the real file type,
+# no matter what the URL or the server claims.
+SIGNATURES = [
+    (b"PK\x03\x04", "ZIP archive"),
+    (b"\x1f\x8b", "gzip archive"),
+    (b"BZh", "bzip2 archive"),
+    (b"\xfd7zXZ\x00", "xz archive"),
+    (b"(\xb5/\xfd", "zstd archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"!<arch>", "ar archive / .deb package"),
+    (b"\xed\xab\xee\xdb", "RPM package"),
+    (b"\x7fELF", "Linux executable (ELF binary)"),
+    (b"MZ", "Windows executable"),
+    (b"\xca\xfe\xba\xbe", "Mach-O binary / Java class"),
+    (b"%PDF", "PDF document"),
+    (b"\x89PNG", "PNG image"),
+    (b"\xff\xd8\xff", "JPEG image"),
+    (b"GIF8", "GIF image"),
+    (b"\x1aE\xdf\xa3", "MKV/WebM video"),
+    (b"ID3", "MP3 audio"),
+    (b"OggS", "Ogg audio/video"),
+    (b"RIFF", "RIFF media (WAV/AVI/WebP)"),
+]
+
+
+def sniff(head, content_type=""):
+    """Return a description if `head` is clearly NOT a script, else None."""
+    for magic, name in SIGNATURES:
+        if head.startswith(magic):
+            return name
+    if head[4:8] == b"ftyp":
+        return "MP4/MOV video"
+    if head[257:262] == b"ustar":
+        return "tar archive"
+    start = head.lstrip()[:20].lower()
+    if start.startswith((b"<!doctype html", b"<html", b"<head")):
+        return "HTML web page"
+    if b"\x00" in head:
+        return "binary data"
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if ctype.startswith(("video/", "audio/", "image/", "font/")):
+        return "%s file" % ctype
+    return None
+
+
+class RedirectRecorder(urllib.request.HTTPRedirectHandler):
+    """Remembers every redirect hop so we can spot HTTPS -> HTTP downgrades."""
+
+    def __init__(self):
+        self.hops = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.hops.append({"status": code, "from": req.full_url, "to": newurl})
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def probe_tls(host, port, timeout):
+    """Open a TLS connection just to read the certificate details."""
+    info = {"host": host}
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with context.wrap_socket(raw, server_hostname=host) as tls:
+                cert = tls.getpeercert() or {}
+                info["version"] = tls.version()
+                issuer = dict(item[0] for item in cert.get("issuer", ()))
+                info["issuer"] = issuer.get("organizationName") or issuer.get("commonName") or "unknown"
+                if cert.get("notAfter"):
+                    expires = ssl.cert_time_to_seconds(cert["notAfter"])
+                    info["days_left"] = int((expires - time.time()) // 86400)
+    except ssl.SSLCertVerificationError as exc:
+        info["error"] = exc.verify_message or str(exc)
+    except (ssl.SSLError, OSError) as exc:
+        info["unavailable"] = str(exc)
+    return info
+
+
+def content_length(headers):
+    try:
+        return int(headers.get("Content-Length", ""))
+    except ValueError:
+        return None
+
+
+def fetch_url(url, max_size, timeout, inspect_only):
+    meta = {"source": url, "final_url": url, "kind": None, "size": None,
+            "connection": {"hops": [], "status": None, "headers": {}, "tls": [], "tls_error": None}}
+    conn = meta["connection"]
+    recorder = RedirectRecorder()
+    conn["hops"] = recorder.hops
+    opener = urllib.request.build_opener(recorder)
+    # Pretend to be curl: some servers send different content to browsers,
+    # and we want to see exactly what `curl | bash` would have received.
+    request = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0", "Accept": "*/*"})
+    data = None
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            meta["final_url"] = response.geturl()
+            conn["status"] = getattr(response, "status", None)
+            wanted = ("Content-Type", "Content-Length", "Content-Disposition", "Server",
+                      "Strict-Transport-Security", "Last-Modified")
+            conn["headers"] = {k: response.headers.get(k) for k in wanted if response.headers.get(k)}
+            length = content_length(response.headers)
+            meta["size"] = length
+
+            head = response.read(SNIFF_BYTES)
+            kind = sniff(head, conn["headers"].get("Content-Type"))
+            if kind:
+                meta["kind"] = kind                      # stop: not a script
+            elif inspect_only:
+                meta["kind"] = "not scanned (--inspect)"
+            elif length is not None and length > max_size:
+                meta["kind"] = "file too large to be a script"
+            else:
+                data = head + response.read(max_size + 1 - len(head))
+                if len(data) > max_size:
+                    data, meta["kind"] = None, "file too large to be a script"
+                else:
+                    meta["size"] = len(data)
+    except urllib.error.HTTPError as exc:
+        raise PipeguardError("server returned HTTP %d for %s" % (exc.code, url))
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            conn["tls_error"] = ("cert", reason.verify_message or str(reason))
+        elif isinstance(reason, ssl.SSLError):
+            conn["tls_error"] = ("handshake", getattr(reason, "reason", None) or str(reason))
+        else:
+            raise PipeguardError("could not download %s: %s" % (url, reason))
+        meta["kind"] = "blocked: TLS verification failed"
+    except ssl.SSLError as exc:
+        conn["tls_error"] = ("handshake", getattr(exc, "reason", None) or str(exc))
+        meta["kind"] = "blocked: TLS verification failed"
+    except OSError as exc:
+        raise PipeguardError("could not download %s: %s" % (url, exc))
+
+    if not conn["tls_error"]:
+        probe_tls_hosts(meta, timeout)
+    return data, meta
+
+
+def probe_tls_hosts(meta, timeout):
+    urls = [meta["source"]] + [hop["to"] for hop in meta["connection"]["hops"]]
+    seen = set()
+    for url in urls:
+        parts = urllib.parse.urlparse(url)
+        if parts.scheme != "https" or not parts.hostname or parts.hostname in seen:
+            continue
+        seen.add(parts.hostname)
+        if len(seen) > 3:
+            break
+        meta["connection"]["tls"].append(probe_tls(parts.hostname, parts.port or 443, min(timeout, 5)))
+
+
+def load_input(target, max_size, timeout, inspect_only=False):
+    if target is not None and re.match(r"^https?://", target, re.IGNORECASE):
+        data, meta = fetch_url(target, max_size, timeout, inspect_only)
+    elif target is not None and "://" in target:
+        raise PipeguardError("only http:// and https:// URLs are supported")
+    else:
+        meta = {"source": target, "final_url": None, "kind": None, "size": None, "connection": None}
+        if target is None:
+            if sys.stdin.isatty():
+                raise PipeguardError("no script given. Try: pipeguard URL, pipeguard FILE, or curl URL | pipeguard")
+            meta["source"] = "<stdin>"
+            stream = sys.stdin.buffer
+        else:
+            try:
+                stream = open(target, "rb")
+                meta["size"] = os.fstat(stream.fileno()).st_size
+            except OSError as exc:
+                raise PipeguardError("cannot read %s: %s" % (target, exc.strerror or exc))
+        try:
+            head = stream.read(SNIFF_BYTES)
+            kind = sniff(head)
+            if kind:
+                # Stop reading right away. If this came from `curl | pipeguard`,
+                # curl gets a broken pipe and stops downloading too.
+                meta["kind"] = kind
+                return None, meta
+            if meta["size"] is not None and meta["size"] > max_size:
+                raise PipeguardError("file is %s, too large to be a script (use --max-size)" % human_size(meta["size"]))
+            data = head + stream.read(max_size + 1 - len(head))
+        finally:
+            if stream is not sys.stdin.buffer:
+                stream.close()
+        if len(data) > max_size:
+            raise PipeguardError("input is larger than %s; refusing (use --max-size)" % human_size(max_size))
+        meta["size"] = len(data)
+
+    if data is not None and not data.strip():
+        raise PipeguardError("the script is empty")
+    return data, meta
+
+
+# --------------------------------------------------------------------------
+# Connection & source checks
+# --------------------------------------------------------------------------
+
+SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "v.gd", "rb.gy", "cutt.ly",
+              "ow.ly", "buff.ly", "shorturl.at", "tiny.cc", "t.ly")
+ANON_HOSTS = ("pastebin.com", "paste.ee", "termbin.com", "0x0.st", "transfer.sh", "file.io",
+              "hastebin.com", "paste.rs", "dpaste.org", "controlc.com", "temp.sh", "ghostbin.co")
+
+
+def host_in(host, domains):
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def connection_findings(scanner, meta):
+    conn = meta.get("connection")
+    if not conn:
+        return
+    chain = [meta["source"]] + [hop["to"] for hop in conn["hops"]]
+
+    if chain[0].lower().startswith("http://"):
+        scanner.add(META_RULES["TRN010"], 0, chain[0])
+    for hop in conn["hops"]:
+        if hop["from"].lower().startswith("https://") and hop["to"].lower().startswith("http://"):
+            scanner.add(META_RULES["TRN011"], 0, "%s -> %s" % (hop["from"], hop["to"]))
+    first_host = urllib.parse.urlparse(chain[0]).hostname
+    last_host = urllib.parse.urlparse(chain[-1]).hostname
+    if first_host != last_host:
+        scanner.add(META_RULES["TRN012"], 0, "%s -> %s" % (first_host, last_host))
+
+    seen = set()
+    for url in chain:
+        parts = urllib.parse.urlparse(url)
+        host = (parts.hostname or "").lower()
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        if is_ip(host):
+            scanner.add(META_RULES["SRC001"], 0, url)
+        if host_in(host, SHORTENERS):
+            scanner.add(META_RULES["SRC002"], 0, url)
+        if host_in(host, ANON_HOSTS):
+            scanner.add(META_RULES["SRC003"], 0, url)
+        if "xn--" in host:
+            scanner.add(META_RULES["SRC004"], 0, "%s (shown in browsers as unicode)" % host)
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if port not in (None, 80, 443):
+            scanner.add(META_RULES["SRC005"], 0, url)
+
+    if conn["tls_error"]:
+        kind, reason = conn["tls_error"]
+        rule = META_RULES["TLS001"] if kind == "cert" else META_RULES["TLS002"]
+        scanner.add(rule, 0, reason)
+    for info in conn["tls"]:
+        if info.get("error"):
+            scanner.add(META_RULES["TLS001"], 0, "%s: %s" % (info["host"], info["error"]))
+        if info.get("version") in ("SSLv3", "TLSv1", "TLSv1.1"):
+            scanner.add(META_RULES["TLS004"], 0, "%s uses %s" % (info["host"], info["version"]))
+        if info.get("days_left") is not None and info["days_left"] < 14:
+            scanner.add(META_RULES["TLS003"], 0, "%s: %d days left" % (info["host"], info["days_left"]))
+
+
+def notices_for(data, text):
+    notes = []
+    if b"\x00" in data:
+        notes.append("Input contains NUL bytes - it looks binary, so this analysis is unreliable.")
+    first = text.lstrip().splitlines()[0] if text.strip() else ""
+    if first.startswith("#!") and not re.search(r"\b(?:ba|da|z|k)?sh\b", first):
+        notes.append("Shebang is '%s' - rules are tuned for shell scripts." % first.strip())
+    return notes
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+class Color:
+    enabled = False
+    CODES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33",
+             "blue": "34", "magenta": "35", "cyan": "36", "bgred": "41;97"}
+
+    @classmethod
+    def paint(cls, text, *styles):
+        if not cls.enabled or not styles:
+            return text
+        return "\033[%sm%s\033[0m" % (";".join(cls.CODES[s] for s in styles), text)
+
+
+SEVERITY_STYLE = {"low": ("blue",), "medium": ("yellow",), "high": ("red", "bold"),
+                  "critical": ("bgred", "bold"), "clean": ("green", "bold")}
+
+CONNECTION_TEXT = {
+    "clean": "Connection checks passed. The file's contents were NOT analyzed.",
+    "low": "Minor connection notes. The file's contents were NOT analyzed.",
+    "medium": "Be careful with this source. The file's contents were NOT analyzed.",
+    "high": "Connection problems found. Don't trust this download.",
+    "critical": "Connection is not trustworthy. Don't use this download.",
+}
+
+
+def human_size(n):
+    if n is None:
+        return "unknown size"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def disposition_filename(value):
+    match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", value or "", re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def connection_lines(conn):
+    p = Color.paint
+    out = ["  " + p("Connection", "bold")]
+    for hop in conn["hops"]:
+        out.append("    %s %s  %s -> %s" % (p("Redirect ", "dim"), hop["status"], hop["from"], hop["to"]))
+    for info in conn["tls"]:
+        if info.get("version"):
+            days = info.get("days_left")
+            expiry = ("expires in %d days" % days) if days is not None else "expiry unknown"
+            out.append("    %s %s, cert by %s, %s  %s" % (
+                p("TLS      ", "dim"), info["version"], info["issuer"], expiry, p("(%s)" % info["host"], "dim")))
+        elif info.get("unavailable"):
+            out.append("    %s details unavailable (%s); certificate was still verified" % (
+                p("TLS      ", "dim"), info["host"]))
+    headers = conn["headers"]
+    if conn["status"] is not None:
+        hsts = headers.get("Strict-Transport-Security")
+        out.append("    %s %s" % (p("HSTS     ", "dim"), ("yes (%s)" % hsts) if hsts else "no"))
+        out.append("    %s %s" % (p("Type     ", "dim"), headers.get("Content-Type", "not given")))
+        if headers.get("Server"):
+            out.append("    %s %s" % (p("Server   ", "dim"), headers["Server"]))
+        name = disposition_filename(headers.get("Content-Disposition"))
+        if name:
+            out.append("    %s %s" % (p("Filename ", "dim"), name))
+    out.append("")
+    return out
+
+
+def print_report(result):
+    p = Color.paint
+    out = ["", p("pipeguard %s" % __version__, "bold") + p("  - look before you pipe", "dim"), ""]
+    out.append("  %s  %s" % (p("Source ", "dim"), result["source"]))
+    if result["final_url"] and result["final_url"] != result["source"]:
+        out.append("  %s  %s" % (p("Final  ", "dim"), result["final_url"]))
+    if result["kind"] is None:
+        out.append("  %s  %s, %d lines" % (p("Size   ", "dim"), human_size(result["size"]), result["lines"]))
+        out.append("  %s  %s" % (p("SHA-256", "dim"), result["sha256"]))
+    if result.get("saved_to"):
+        out.append("  %s  %s" % (p("Saved  ", "dim"), result["saved_to"]))
+    out.append("")
+
+    if result["connection"]:
+        out.extend(connection_lines(result["connection"]))
+
+    kind = result["kind"]
+    if kind:
+        out.append("  " + p("Not a script:", "yellow", "bold") + " %s (%s)" % (kind, human_size(result["size"])))
+        if kind.startswith("blocked"):
+            out.append("  Nothing was downloaded. curl would refuse this too, unless someone adds -k.")
+        elif kind.startswith("not scanned"):
+            out.append("  Only headers and the first 4 KB were read.")
+        else:
+            out.append("  Stopped after the first 4 KB, so the rest was never downloaded.")
+            if kind == "HTML web page":
+                out.append("  If this is a GitHub link, use the 'Raw' URL of the file instead.")
+            else:
+                out.append("  pipeguard analyzes scripts; it can't judge what's inside archives, media or binaries.")
+                out.append("  To verify a file like this, compare `sha256sum FILE` with the publisher's checksum.")
+        out.append("")
+
+    for note in result["notices"]:
+        out.append("  " + p("note:", "yellow", "bold") + " " + note)
+        out.append("")
+
+    groups = {}
+    for f in result["findings"]:
+        groups.setdefault(f["rule"], []).append(f)
+    ordered = sorted(groups.values(),
+                     key=lambda g: (-SEVERITIES.index(g[0]["severity"]), g[0]["line"]))
+    if not ordered:
+        out.append("  " + p("No findings.", "green"))
+        out.append("")
+    for group in ordered:
+        first = group[0]
+        label = p(" %-8s " % first["severity"].upper(), *SEVERITY_STYLE[first["severity"]])
+        out.append("  %s %s %s" % (label, p(first["title"], "bold"),
+                                   p("[%s %s]" % (first["rule"], first["category"]), "dim")))
+        for f in group[:MAX_SHOWN_PER_RULE]:
+            where = ("L%d" % f["line"]) if f["line"] else "-"
+            out.append("      %s  %s" % (p("%-5s" % where, "cyan"), f["code"]))
+            if f["context"]:
+                out.append("             %s" % p("^ " + f["context"], "magenta"))
+        if len(group) > MAX_SHOWN_PER_RULE:
+            out.append("             " + p("...and %d more" % (len(group) - MAX_SHOWN_PER_RULE), "dim"))
+        out.append("")
+
+    hosts = []
+    for url in result["urls"]:
+        host = urllib.parse.urlparse(url).hostname
+        if host and host not in hosts:
+            hosts.append(host)
+    if hosts:
+        out.append("  " + p("Talks to:", "bold") + " " + ", ".join(hosts))
+        out.append("")
+
+    verdict = result["verdict"]
+    label = "Verdict:" if kind is None else "Connection:"
+    out.append("  %s %s/100   %s %s" % (
+        p("Risk score:", "bold"), result["score"],
+        p(label, "bold"), p(" %s " % verdict.upper(), *SEVERITY_STYLE[verdict])))
+    out.append("  " + (VERDICT_TEXT if kind is None else CONNECTION_TEXT)[verdict])
+    out.append("")
+    print("\n".join(out))
+
+
+# --------------------------------------------------------------------------
+# Running the script (only the exact bytes we analyzed)
+# --------------------------------------------------------------------------
+
+def open_terminal():
+    """Terminal for prompts, even when our stdin is the piped script."""
+    if sys.stdin.isatty():
+        return sys.stdin
+    try:
+        return open("/dev/tty", "r")
+    except OSError:
+        return None
+
+
+def confirm_run(verdict, terminal):
+    p = Color.paint
+    if verdict in ("high", "critical"):
+        question = p('Type "yes" to run it anyway: ', "red", "bold")
+        accepted = ("yes",)
+    else:
+        question = "Run this script now? [y/N] "
+        accepted = ("y", "yes")
+    sys.stdout.write(question)
+    sys.stdout.flush()
+    return terminal.readline().strip().lower() in accepted
+
+
+def run_saved_script(path, shell, use_sudo, terminal):
+    interpreter = shutil.which(shell)
+    if not interpreter:
+        raise PipeguardError("shell '%s' not found on this system" % shell)
+    command = [interpreter, path]
+    if use_sudo:
+        sudo = shutil.which("sudo")
+        if not sudo:
+            raise PipeguardError("--sudo given but sudo is not installed")
+        command = [sudo] + command
+    # Give the script a real terminal so interactive installers still work.
+    stdin = terminal if terminal is not sys.stdin else None
+    return subprocess.call(command, stdin=stdin)
+
+
+def save_copy(data):
+    fd, path = tempfile.mkstemp(prefix="pipeguard-", suffix=".sh")
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    os.chmod(path, 0o600)
+    return path
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def analyze(data, meta):
+    scanner = Scanner()
+    text = ""
+    if data is not None:
+        text = data.decode("utf-8", errors="replace")
+        scanner.scan(text)
+    connection_findings(scanner, meta)
+    score = compute_score(scanner.findings)
+    return {
+        "tool": "pipeguard",
+        "version": __version__,
+        "source": meta["source"],
+        "final_url": meta.get("final_url"),
+        "kind": meta.get("kind"),
+        "size": meta.get("size", len(data) if data is not None else None),
+        "lines": (text.count("\n") + (0 if text.endswith("\n") else 1)) if data is not None else None,
+        "sha256": hashlib.sha256(data).hexdigest() if data is not None else None,
+        "score": score,
+        "verdict": compute_verdict(scanner.findings, score),
+        "findings": scanner.findings,
+        "urls": scanner.urls,
+        "connection": meta.get("connection"),
+        "notices": notices_for(data, text) if data is not None else [],
+    }
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="pipeguard",
+        description="Look before you pipe: analyze a shell script for risky behaviour before running it.",
+        epilog="examples:\n"
+               "  pipeguard https://example.com/install.sh\n"
+               "  pipeguard --inspect https://example.com/big-download.zip\n"
+               "  pipeguard ./install.sh\n"
+               "  curl -fsSL https://example.com/install.sh | pipeguard --run\n\n"
+               "exit codes: 0 clean/low, 1 medium, 2 high/critical, 3 error\n"
+               "(with --run, the script's own exit code is returned)",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("target", nargs="?", help="URL or file path (omit to read from stdin)")
+    parser.add_argument("--run", action="store_true",
+                        help="after the report, ask to run the exact analyzed copy")
+    parser.add_argument("--inspect", action="store_true",
+                        help="URL only: check redirects, TLS and headers without downloading the body")
+    parser.add_argument("--shell", default="bash", help="shell used by --run (default: bash)")
+    parser.add_argument("--sudo", action="store_true", help="with --run, run it via sudo")
+    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    parser.add_argument("--keep", action="store_true", help="keep the saved copy and print its path")
+    parser.add_argument("--no-color", action="store_true", help="disable colors (NO_COLOR also works)")
+    parser.add_argument("--max-size", type=int, default=MAX_SIZE_DEFAULT, metavar="BYTES",
+                        help="refuse scripts bigger than this (default: 5 MB)")
+    parser.add_argument("--timeout", type=int, default=TIMEOUT_DEFAULT, metavar="SEC",
+                        help="network timeout in seconds (default: %d)" % TIMEOUT_DEFAULT)
+    parser.add_argument("-V", "--version", action="version", version="pipeguard " + __version__)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    Color.enabled = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+
+    for bad, message in ((args.sudo and not args.run, "--sudo only makes sense with --run"),
+                         (args.run and args.json, "--run and --json can't be combined"),
+                         (args.run and args.inspect, "--run and --inspect can't be combined")):
+        if bad:
+            print("pipeguard: " + message, file=sys.stderr)
+            return EXIT_ERROR
+
+    saved = None
+    try:
+        data, meta = load_input(args.target, args.max_size, args.timeout, args.inspect)
+        result = analyze(data, meta)
+
+        if data is not None and (args.run or args.keep):
+            saved = save_copy(data)
+            if args.keep:
+                result["saved_to"] = saved
+
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print_report(result)
+
+        code = EXIT_FOR_VERDICT[result["verdict"]]
+        if args.run:
+            if data is None:
+                raise PipeguardError("refusing to run: this is not a script")
+            terminal = open_terminal()
+            if terminal is None:
+                raise PipeguardError("no terminal available to confirm, refusing to run")
+            if confirm_run(result["verdict"], terminal):
+                print(Color.paint("Running the analyzed copy (sha256 %s...)\n" % result["sha256"][:16], "dim"))
+                code = run_saved_script(saved, args.shell, args.sudo, terminal)
+            else:
+                print("Not running it.")
+        return code
+
+    except PipeguardError as exc:
+        print("pipeguard: " + str(exc), file=sys.stderr)
+        return EXIT_ERROR
+    except BrokenPipeError:
+        # output was piped into something like `head` that closed early
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return EXIT_OK
+    except KeyboardInterrupt:
+        print("\npipeguard: interrupted", file=sys.stderr)
+        return 130
+    finally:
+        if saved and not args.keep:
+            try:
+                os.remove(saved)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
