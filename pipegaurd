@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 MAX_SIZE_DEFAULT = 5 * 1024 * 1024  # 5 MB is far bigger than any sane installer
 TIMEOUT_DEFAULT = 20
@@ -463,20 +463,46 @@ class RedirectRecorder(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def tls_context(strict=False):
+    """Certificate checking with the same rules curl and browsers use.
+
+    Python 3.13+ turns on VERIFY_X509_STRICT by default, which also rejects
+    chains with minor RFC 5280 formatting issues (e.g. a CA cert whose Basic
+    Constraints aren't marked critical). curl, Firefox and Chrome accept those,
+    so we switch strict mode off. The chain, expiry and hostname are still
+    fully verified.
+    """
+    context = ssl.create_default_context()
+    flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+    if strict:
+        context.verify_flags |= flag
+    else:
+        context.verify_flags &= ~flag
+    return context
+
+
+def _read_cert(host, port, timeout, context):
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            return tls.getpeercert() or {}, tls.version()
+
+
 def probe_tls(host, port, timeout):
     """Open a TLS connection just to read the certificate details."""
     info = {"host": host}
-    context = ssl.create_default_context()
     try:
-        with socket.create_connection((host, port), timeout=timeout) as raw:
-            with context.wrap_socket(raw, server_hostname=host) as tls:
-                cert = tls.getpeercert() or {}
-                info["version"] = tls.version()
-                issuer = dict(item[0] for item in cert.get("issuer", ()))
-                info["issuer"] = issuer.get("organizationName") or issuer.get("commonName") or "unknown"
-                if cert.get("notAfter"):
-                    expires = ssl.cert_time_to_seconds(cert["notAfter"])
-                    info["days_left"] = int((expires - time.time()) // 86400)
+        try:
+            cert, version = _read_cert(host, port, timeout, tls_context(strict=True))
+        except ssl.SSLCertVerificationError as strict_exc:
+            # Fails strict RFC 5280 rules - does it pass the normal rules?
+            cert, version = _read_cert(host, port, timeout, tls_context())
+            info["strict_note"] = strict_exc.verify_message or str(strict_exc)
+        info["version"] = version
+        issuer = dict(item[0] for item in cert.get("issuer", ()))
+        info["issuer"] = issuer.get("organizationName") or issuer.get("commonName") or "unknown"
+        if cert.get("notAfter"):
+            expires = ssl.cert_time_to_seconds(cert["notAfter"])
+            info["days_left"] = int((expires - time.time()) // 86400)
     except ssl.SSLCertVerificationError as exc:
         info["error"] = exc.verify_message or str(exc)
     except (ssl.SSLError, OSError) as exc:
@@ -497,7 +523,7 @@ def fetch_url(url, max_size, timeout, inspect_only):
     conn = meta["connection"]
     recorder = RedirectRecorder()
     conn["hops"] = recorder.hops
-    opener = urllib.request.build_opener(recorder)
+    opener = urllib.request.build_opener(recorder, urllib.request.HTTPSHandler(context=tls_context()))
     # Pretend to be curl: some servers send different content to browsers,
     # and we want to see exactly what `curl | bash` would have received.
     request = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0", "Accept": "*/*"})
@@ -753,11 +779,11 @@ SEVERITY_STYLE = {"low": ("blue",), "medium": ("yellow",), "high": ("red", "bold
                   "critical": ("bgred", "bold"), "clean": ("green", "bold")}
 
 CONNECTION_TEXT = {
-    "clean": "Connection checks passed. The file's contents were NOT analyzed.",
-    "low": "Minor connection notes. The file's contents were NOT analyzed.",
-    "medium": "Be careful with this source. The file's contents were NOT analyzed.",
-    "high": "Connection problems found. Don't trust this download.",
-    "critical": "Connection is not trustworthy. Don't use this download.",
+    "clean": "The connection to this site is secure. (Content was not analyzed.)",
+    "low": "The connection is secure; see the minor notes above. (Content was not analyzed.)",
+    "medium": "The connection works, but be careful with this source. (Content was not analyzed.)",
+    "high": "Connection problems found. Don't trust anything downloaded from here.",
+    "critical": "This connection is not trustworthy. Don't download or log in here.",
 }
 
 
@@ -786,7 +812,11 @@ def connection_lines(conn):
             expiry = ("expires in %d days" % days) if days is not None else "expiry unknown"
             out.append("    %s %s, cert by %s, %s  %s" % (
                 p("TLS      ", "dim"), info["version"], info["issuer"], expiry, p("(%s)" % info["host"], "dim")))
-        elif info.get("unavailable"):
+        if info.get("strict_note"):
+            out.append("    %s %s" % (p("Note     ", "dim"), p(
+                "chain fails Python's extra-strict X.509 check (%s); curl and browsers accept it"
+                % info["strict_note"], "dim")))
+        if info.get("unavailable"):
             out.append("    %s details unavailable (%s); certificate was still verified" % (
                 p("TLS      ", "dim"), info["host"]))
     headers = conn["headers"]
@@ -822,7 +852,14 @@ def print_report(result):
         out.extend(connection_lines(result["connection"]))
 
     kind = result["kind"]
-    if kind:
+    if kind == "HTML web page" or (kind or "").startswith("not scanned"):
+        out.append("  " + p("Site check:", "cyan", "bold") + " %s" % (
+            "web page - only the connection was checked" if kind == "HTML web page"
+            else "connection only (--inspect), the body was not downloaded"))
+        if "/blob/" in (result["final_url"] or result["source"] or ""):
+            out.append("  Looking for a script on GitHub? Use the file's 'Raw' URL instead.")
+        out.append("")
+    elif kind:
         out.append("  " + p("Not a script:", "yellow", "bold") + " %s (%s)" % (kind, human_size(result["size"])))
         if kind.startswith("blocked"):
             out.append("  Nothing was downloaded. curl would refuse this too, unless someone adds -k.")
@@ -830,11 +867,8 @@ def print_report(result):
             out.append("  Only headers and the first 4 KB were read.")
         else:
             out.append("  Stopped after the first 4 KB, so the rest was never downloaded.")
-            if kind == "HTML web page":
-                out.append("  If this is a GitHub link, use the 'Raw' URL of the file instead.")
-            else:
-                out.append("  pipegaurd analyzes scripts; it can't judge what's inside archives, media or binaries.")
-                out.append("  To verify a file like this, compare `sha256sum FILE` with the publisher's checksum.")
+            out.append("  pipegaurd analyzes scripts; it can't judge what's inside archives, media or binaries.")
+            out.append("  To verify a file like this, compare `sha256sum FILE` with the publisher's checksum.")
         out.append("")
 
     for note in result["notices"]:
@@ -970,7 +1004,7 @@ def build_parser():
         epilog="examples:\n"
                "  pipegaurd https://example.com/install.sh\n"
                "  pipegaurd get.docker.com            (bare domains use https://)\n"
-               "  pipegaurd --inspect https://example.com/big-download.zip\n"
+               "  pipegaurd -i github.com                 (site / connection check only)\n"
                "  pipegaurd ./install.sh\n"
                "  curl -fsSL https://example.com/install.sh | pipegaurd --run\n\n"
                "exit codes: 0 clean/low, 1 medium, 2 high/critical, 3 error\n"
@@ -980,8 +1014,8 @@ def build_parser():
                         help="URL, bare domain (example.com -> https://example.com) or file path; omit to read stdin")
     parser.add_argument("--run", action="store_true",
                         help="after the report, ask to run the exact analyzed copy")
-    parser.add_argument("--inspect", action="store_true",
-                        help="URL only: check redirects, TLS and headers without downloading the body")
+    parser.add_argument("-i", "--inspect", "--site", dest="inspect", action="store_true",
+                        help="site check: redirects, TLS and headers only, the body is not downloaded")
     parser.add_argument("--shell", default="bash", help="shell used by --run (default: bash)")
     parser.add_argument("--sudo", action="store_true", help="with --run, run it via sudo")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")

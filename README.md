@@ -39,8 +39,9 @@ curl -fsSL https://example.com/install.sh | pipegaurd --run
 # check a local file
 pipegaurd ./install.sh
 
-# check only the connection (redirects, TLS, headers) without downloading
-pipegaurd --inspect https://example.com/some-download.iso
+# check only a site's connection (redirects, TLS, headers), nothing is downloaded
+pipegaurd -i github.com
+pipegaurd -i https://example.com/some-download.iso
 ```
 
 ## Installation
@@ -97,7 +98,7 @@ It also recognises files that aren't scripts (archives, binaries, videos, HTML p
 | Option | What it does |
 |---|---|
 | `--run` | After the report, ask to run the exact analyzed copy. High/critical scripts require typing `yes` in full. |
-| `--inspect` | URLs only: check redirects, TLS and headers without downloading the body. |
+| `-i`, `--inspect`, `--site` | Site check: redirects, TLS and headers only; the body is not downloaded. Plain web pages get this report automatically. |
 | `--shell SHELL` | Shell used by `--run` (default `bash`). |
 | `--sudo` | With `--run`, run the script through `sudo`. |
 | `--json` | Machine-readable output. |

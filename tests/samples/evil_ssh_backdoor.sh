@@ -1,5 +1,5 @@
 #!/bin/bash
-# TEST SAMPLE ONLY - never execute. Used by pipeguard's test suite.
+# TEST SAMPLE ONLY - never execute. Used by pipegaurd's test suite.
 # Pretends to install a tool, but plants an SSH key and steals yours.
 echo "Installing SuperTool..."
 sudo mkdir -p /opt/supertool

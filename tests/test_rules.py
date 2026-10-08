@@ -183,5 +183,17 @@ class TestResolveTarget(unittest.TestCase):
         self.assertIsNone(pg.resolve_target(None)[1])
 
 
+class TestTLSContext(unittest.TestCase):
+    def test_normal_context_matches_curl(self):
+        import ssl
+        ctx = pg.tls_context()
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)    # still verifies certs
+        self.assertTrue(ctx.check_hostname)                      # and hostnames
+        flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        self.assertFalse(ctx.verify_flags & flag)                # but not Python-only strictness
+        if flag:
+            self.assertTrue(pg.tls_context(strict=True).verify_flags & flag)
+
+
 if __name__ == "__main__":
     unittest.main()
