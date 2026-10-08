@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pipeguard - look before you pipe.
+pipegaurd - look before you pipe.
 
 Static analysis for shell scripts you are about to run with `curl ... | bash`.
 It downloads (or reads) a script, flags risky patterns, and - if you choose to
@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 MAX_SIZE_DEFAULT = 5 * 1024 * 1024  # 5 MB is far bigger than any sane installer
 TIMEOUT_DEFAULT = 20
@@ -401,7 +401,7 @@ EXIT_FOR_VERDICT = {"clean": EXIT_OK, "low": EXIT_OK, "medium": EXIT_WARN,
 # Input: fetch, sniff, and stop early on anything that isn't a script
 # --------------------------------------------------------------------------
 
-class PipeguardError(Exception):
+class PipegaurdError(Exception):
     pass
 
 
@@ -527,7 +527,7 @@ def fetch_url(url, max_size, timeout, inspect_only):
                 else:
                     meta["size"] = len(data)
     except urllib.error.HTTPError as exc:
-        raise PipeguardError("server returned HTTP %d for %s" % (exc.code, url))
+        raise PipegaurdError("server returned HTTP %d for %s" % (exc.code, url))
     except urllib.error.URLError as exc:
         reason = exc.reason
         if isinstance(reason, ssl.SSLCertVerificationError):
@@ -535,13 +535,13 @@ def fetch_url(url, max_size, timeout, inspect_only):
         elif isinstance(reason, ssl.SSLError):
             conn["tls_error"] = ("handshake", getattr(reason, "reason", None) or str(reason))
         else:
-            raise PipeguardError("could not download %s: %s" % (url, reason))
+            raise PipegaurdError("could not download %s: %s" % (url, reason))
         meta["kind"] = "blocked: TLS verification failed"
     except ssl.SSLError as exc:
         conn["tls_error"] = ("handshake", getattr(exc, "reason", None) or str(exc))
         meta["kind"] = "blocked: TLS verification failed"
     except OSError as exc:
-        raise PipeguardError("could not download %s: %s" % (url, exc))
+        raise PipegaurdError("could not download %s: %s" % (url, exc))
 
     if not conn["tls_error"]:
         probe_tls_hosts(meta, timeout)
@@ -561,44 +561,92 @@ def probe_tls_hosts(meta, timeout):
         meta["connection"]["tls"].append(probe_tls(parts.hostname, parts.port or 443, min(timeout, 5)))
 
 
-def load_input(target, max_size, timeout, inspect_only=False):
-    if target is not None and re.match(r"^https?://", target, re.IGNORECASE):
-        data, meta = fetch_url(target, max_size, timeout, inspect_only)
-    elif target is not None and "://" in target:
-        raise PipeguardError("only http:// and https:// URLs are supported")
-    else:
-        meta = {"source": target, "final_url": None, "kind": None, "size": None, "connection": None}
-        if target is None:
-            if sys.stdin.isatty():
-                raise PipeguardError("no script given. Try: pipeguard URL, pipeguard FILE, or curl URL | pipeguard")
-            meta["source"] = "<stdin>"
-            stream = sys.stdin.buffer
-        else:
-            try:
-                stream = open(target, "rb")
-                meta["size"] = os.fstat(stream.fileno()).st_size
-            except OSError as exc:
-                raise PipeguardError("cannot read %s: %s" % (target, exc.strerror or exc))
-        try:
-            head = stream.read(SNIFF_BYTES)
-            kind = sniff(head)
-            if kind:
-                # Stop reading right away. If this came from `curl | pipeguard`,
-                # curl gets a broken pipe and stops downloading too.
-                meta["kind"] = kind
-                return None, meta
-            if meta["size"] is not None and meta["size"] > max_size:
-                raise PipeguardError("file is %s, too large to be a script (use --max-size)" % human_size(meta["size"]))
-            data = head + stream.read(max_size + 1 - len(head))
-        finally:
-            if stream is not sys.stdin.buffer:
-                stream.close()
-        if len(data) > max_size:
-            raise PipeguardError("input is larger than %s; refusing (use --max-size)" % human_size(max_size))
-        meta["size"] = len(data)
+# A bare host like "google.com", "get.docker.com/", "sh.rustup.rs" or
+# "example.com:8443/install.sh". Needs at least one dot and a letter TLD
+# (or a plain IPv4 address), so random words don't turn into URLs.
+BARE_HOST = re.compile(
+    r"^(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})"
+    r"|\d{1,3}(?:\.\d{1,3}){3})"
+    r"(?::\d{1,5})?(?:[/?#].*)?$",
+    re.IGNORECASE)
 
+
+def resolve_target(target):
+    """Turn what the user typed into (kind, value): ("url", ...), ("file", ...) or ("stdin", None).
+
+    Rules, in order:
+      1. Nothing given                      -> stdin
+      2. Has a scheme (https://, ftp://)    -> URL (scheme checked later)
+      3. Looks like a path (./ / ~ ..)      -> file
+      4. An existing local file             -> file   (a file named "install.sh" wins)
+      5. Looks like a domain or IPv4        -> https:// URL  (never http://)
+      6. Anything else                      -> file   (gives a normal "cannot read" error)
+    """
+    if target is None:
+        return "stdin", None
+    if "://" in target:
+        return "url", target
+    if target.startswith(("/", "./", "../", "~")):
+        return "file", os.path.expanduser(target)
+    if os.path.exists(target):
+        return "file", target
+    if BARE_HOST.match(target):
+        return "url", "https://" + target
+    return "file", target
+
+
+def load_input(target, max_size, timeout, inspect_only=False):
+    typed = target
+    kind, target = resolve_target(target)
+    if kind == "url":
+        if not re.match(r"^https?://", target, re.IGNORECASE):
+            raise PipegaurdError("only http:// and https:// URLs are supported")
+        try:
+            data, meta = fetch_url(target, max_size, timeout, inspect_only)
+        except PipegaurdError as exc:
+            if typed == target:
+                raise
+            # We guessed this was a domain; say so in case it was a missing file.
+            raise PipegaurdError("%s\n  (treated '%s' as %s - if you meant a local file, use ./%s)"
+                                 % (exc, typed, target, typed))
+        meta["typed"] = typed
+        return finish_load(data, meta)
+
+    meta = {"source": target, "final_url": None, "kind": None, "size": None, "connection": None}
+    if kind == "stdin":
+        if sys.stdin.isatty():
+            raise PipegaurdError("no script given. Try: pipegaurd URL, pipegaurd FILE, or curl URL | pipegaurd")
+        meta["source"] = "<stdin>"
+        stream = sys.stdin.buffer
+    else:
+        try:
+            stream = open(target, "rb")
+            meta["size"] = os.fstat(stream.fileno()).st_size
+        except OSError as exc:
+            raise PipegaurdError("cannot read %s: %s" % (target, exc.strerror or exc))
+    try:
+        head = stream.read(SNIFF_BYTES)
+        sniffed = sniff(head)
+        if sniffed:
+            # Stop reading right away. If this came from `curl | pipegaurd`,
+            # curl gets a broken pipe and stops downloading too.
+            meta["kind"] = sniffed
+            return None, meta
+        if meta["size"] is not None and meta["size"] > max_size:
+            raise PipegaurdError("file is %s, too large to be a script (use --max-size)" % human_size(meta["size"]))
+        data = head + stream.read(max_size + 1 - len(head))
+    finally:
+        if stream is not sys.stdin.buffer:
+            stream.close()
+    if len(data) > max_size:
+        raise PipegaurdError("input is larger than %s; refusing (use --max-size)" % human_size(max_size))
+    meta["size"] = len(data)
+    return finish_load(data, meta)
+
+
+def finish_load(data, meta):
     if data is not None and not data.strip():
-        raise PipeguardError("the script is empty")
+        raise PipegaurdError("the script is empty")
     return data, meta
 
 
@@ -757,8 +805,10 @@ def connection_lines(conn):
 
 def print_report(result):
     p = Color.paint
-    out = ["", p("pipeguard %s" % __version__, "bold") + p("  - look before you pipe", "dim"), ""]
+    out = ["", p("pipegaurd %s" % __version__, "bold") + p("  - look before you pipe", "dim"), ""]
     out.append("  %s  %s" % (p("Source ", "dim"), result["source"]))
+    if result.get("typed") and result["typed"] != result["source"]:
+        out.append("  %s  %s" % (p("       ", "dim"), p("(you typed '%s'; assumed https://)" % result["typed"], "dim")))
     if result["final_url"] and result["final_url"] != result["source"]:
         out.append("  %s  %s" % (p("Final  ", "dim"), result["final_url"]))
     if result["kind"] is None:
@@ -783,7 +833,7 @@ def print_report(result):
             if kind == "HTML web page":
                 out.append("  If this is a GitHub link, use the 'Raw' URL of the file instead.")
             else:
-                out.append("  pipeguard analyzes scripts; it can't judge what's inside archives, media or binaries.")
+                out.append("  pipegaurd analyzes scripts; it can't judge what's inside archives, media or binaries.")
                 out.append("  To verify a file like this, compare `sha256sum FILE` with the publisher's checksum.")
         out.append("")
 
@@ -862,12 +912,12 @@ def confirm_run(verdict, terminal):
 def run_saved_script(path, shell, use_sudo, terminal):
     interpreter = shutil.which(shell)
     if not interpreter:
-        raise PipeguardError("shell '%s' not found on this system" % shell)
+        raise PipegaurdError("shell '%s' not found on this system" % shell)
     command = [interpreter, path]
     if use_sudo:
         sudo = shutil.which("sudo")
         if not sudo:
-            raise PipeguardError("--sudo given but sudo is not installed")
+            raise PipegaurdError("--sudo given but sudo is not installed")
         command = [sudo] + command
     # Give the script a real terminal so interactive installers still work.
     stdin = terminal if terminal is not sys.stdin else None
@@ -875,7 +925,7 @@ def run_saved_script(path, shell, use_sudo, terminal):
 
 
 def save_copy(data):
-    fd, path = tempfile.mkstemp(prefix="pipeguard-", suffix=".sh")
+    fd, path = tempfile.mkstemp(prefix="pipegaurd-", suffix=".sh")
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
     os.chmod(path, 0o600)
@@ -895,9 +945,10 @@ def analyze(data, meta):
     connection_findings(scanner, meta)
     score = compute_score(scanner.findings)
     return {
-        "tool": "pipeguard",
+        "tool": "pipegaurd",
         "version": __version__,
         "source": meta["source"],
+        "typed": meta.get("typed"),
         "final_url": meta.get("final_url"),
         "kind": meta.get("kind"),
         "size": meta.get("size", len(data) if data is not None else None),
@@ -914,17 +965,19 @@ def analyze(data, meta):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="pipeguard",
+        prog="pipegaurd",
         description="Look before you pipe: analyze a shell script for risky behaviour before running it.",
         epilog="examples:\n"
-               "  pipeguard https://example.com/install.sh\n"
-               "  pipeguard --inspect https://example.com/big-download.zip\n"
-               "  pipeguard ./install.sh\n"
-               "  curl -fsSL https://example.com/install.sh | pipeguard --run\n\n"
+               "  pipegaurd https://example.com/install.sh\n"
+               "  pipegaurd get.docker.com            (bare domains use https://)\n"
+               "  pipegaurd --inspect https://example.com/big-download.zip\n"
+               "  pipegaurd ./install.sh\n"
+               "  curl -fsSL https://example.com/install.sh | pipegaurd --run\n\n"
                "exit codes: 0 clean/low, 1 medium, 2 high/critical, 3 error\n"
                "(with --run, the script's own exit code is returned)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("target", nargs="?", help="URL or file path (omit to read from stdin)")
+    parser.add_argument("target", nargs="?",
+                        help="URL, bare domain (example.com -> https://example.com) or file path; omit to read stdin")
     parser.add_argument("--run", action="store_true",
                         help="after the report, ask to run the exact analyzed copy")
     parser.add_argument("--inspect", action="store_true",
@@ -938,7 +991,7 @@ def build_parser():
                         help="refuse scripts bigger than this (default: 5 MB)")
     parser.add_argument("--timeout", type=int, default=TIMEOUT_DEFAULT, metavar="SEC",
                         help="network timeout in seconds (default: %d)" % TIMEOUT_DEFAULT)
-    parser.add_argument("-V", "--version", action="version", version="pipeguard " + __version__)
+    parser.add_argument("-V", "--version", action="version", version="pipegaurd " + __version__)
     return parser
 
 
@@ -950,7 +1003,7 @@ def main(argv=None):
                          (args.run and args.json, "--run and --json can't be combined"),
                          (args.run and args.inspect, "--run and --inspect can't be combined")):
         if bad:
-            print("pipeguard: " + message, file=sys.stderr)
+            print("pipegaurd: " + message, file=sys.stderr)
             return EXIT_ERROR
 
     saved = None
@@ -971,10 +1024,10 @@ def main(argv=None):
         code = EXIT_FOR_VERDICT[result["verdict"]]
         if args.run:
             if data is None:
-                raise PipeguardError("refusing to run: this is not a script")
+                raise PipegaurdError("refusing to run: this is not a script")
             terminal = open_terminal()
             if terminal is None:
-                raise PipeguardError("no terminal available to confirm, refusing to run")
+                raise PipegaurdError("no terminal available to confirm, refusing to run")
             if confirm_run(result["verdict"], terminal):
                 print(Color.paint("Running the analyzed copy (sha256 %s...)\n" % result["sha256"][:16], "dim"))
                 code = run_saved_script(saved, args.shell, args.sudo, terminal)
@@ -982,15 +1035,15 @@ def main(argv=None):
                 print("Not running it.")
         return code
 
-    except PipeguardError as exc:
-        print("pipeguard: " + str(exc), file=sys.stderr)
+    except PipegaurdError as exc:
+        print("pipegaurd: " + str(exc), file=sys.stderr)
         return EXIT_ERROR
     except BrokenPipeError:
         # output was piped into something like `head` that closed early
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return EXIT_OK
     except KeyboardInterrupt:
-        print("\npipeguard: interrupted", file=sys.stderr)
+        print("\npipegaurd: interrupted", file=sys.stderr)
         return 130
     finally:
         if saved and not args.keep:
